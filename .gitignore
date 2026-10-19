@@ -1,0 +1,11 @@
+/target/
+/artifacts/
+/exports/
+/test-output/
+*.log
+.env
+.env.*
+!.env.example
+*.pdb
+*.partial
+/docs/screenshots/*.svg

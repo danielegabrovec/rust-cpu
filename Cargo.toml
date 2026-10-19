@@ -1,0 +1,36 @@
+[package]
+name = "rust-cpu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Hardware insight and local LLM observability in a polished terminal workspace"
+license = "MIT"
+authors = ["Daniele Gabrovec"]
+repository = "https://github.com/danielegabrovec/rust-cpu"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+sysinfo = "0.39.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time"] }
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
+raw-cpuid = "11.6"
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.18.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
