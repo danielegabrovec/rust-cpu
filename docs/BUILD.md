@@ -68,8 +68,8 @@ su altre architetture o correttezza di un runtime LLM reale non avviato.
 
 Il workflow `.github/workflows/ci.yml` configura una matrice Windows/Linux con
 formattazione, Clippy, test, build release e snapshot senza LLM. Il job Windows
-richiama inoltre lo script di packaging usando il percorso NSIS specificato nel
-workflow e carica gli artefatti di quel job. Consultare l'esito della singola
+installa NSIS con Chocolatey quando assente, poi richiama lo script di packaging
+e carica gli artefatti di quel job. Consultare l'esito della singola
 esecuzione prima di dichiarare verificata la CI.
 
 ## ZIP portable e installer Windows

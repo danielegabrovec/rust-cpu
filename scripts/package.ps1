@@ -22,7 +22,7 @@ try {
         $command = Get-Command makensis -ErrorAction SilentlyContinue
         if ($command) { $MakeNsis = $command.Source }
         else {
-            foreach ($candidate in @('C:\Program Files (x86)\NSIS\makensis.exe', "$env:LOCALAPPDATA\tauri\NSIS\makensis.exe")) {
+            foreach ($candidate in @('C:\Program Files (x86)\NSIS\makensis.exe', 'C:\Program Files\NSIS\makensis.exe', "$env:LOCALAPPDATA\tauri\NSIS\makensis.exe")) {
                 if (Test-Path -LiteralPath $candidate) { $MakeNsis = $candidate; break }
             }
         }
