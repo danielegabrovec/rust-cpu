@@ -15,6 +15,8 @@ const ALGORITHM: &str = "RUST-CPU mix64 v1: 1 op = add + 2 wrapping multiplies +
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CpuBenchmark {
+    #[serde(default)]
+    pub build_profile: String,
     pub single_ops_per_sec: f64,
     pub multi_ops_per_sec: f64,
     pub threads: usize,
@@ -30,6 +32,12 @@ pub fn run(cancel: Arc<AtomicBool>) -> Result<CpuBenchmark> {
     let single_ops_per_sec = measure_for(PHASE_DURATION, 1, Arc::clone(&cancel))?;
     let multi_ops_per_sec = measure_for(PHASE_DURATION, threads, cancel)?;
     Ok(CpuBenchmark {
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "optimized"
+        }
+        .into(),
         single_ops_per_sec,
         multi_ops_per_sec,
         threads,

@@ -79,7 +79,7 @@ fn collect_inventory() -> Hardware {
     inv.warnings.push(
         "Inventario scheda madre, BIOS e moduli DIMM esteso disponibile su Windows via WMI.".into(),
     );
-    inv.warnings.push("SPD diretto, timing RAM, tensioni CPU e clock per core effettivi richiedono driver privilegiati: non misurati.".into());
+    inv.warnings.push("SPD diretto, timing RAM e clock per core effettivi richiedono provider specifici: non misurati. Temperature e tensioni avanzate sono opzionali tramite LibreHardwareMonitor già in esecuzione.".into());
     inv.warnings.push("Le feature CPUID descrivono l'hardware; il sistema operativo può limitarne l'utilizzo. La frequenza OS può essere nominale.".into());
     hw
 }
@@ -398,8 +398,8 @@ fn windows_inventory() -> Result<WmiInventory, String> {
             .push("WMI: inventario GPU non disponibile.".into()),
     }
     out.graphics.push(Detail::new(
-        "VRAM e sensori",
-        "Misurati via nvidia-smi quando disponibile; AdapterRAM WMI non usata (limite 32 bit).",
+        "Carico e memoria GPU",
+        "Windows WDDM / PDH con mappatura DXGI; memoria dedicata e condivisa separate. Sensori NVIDIA via nvidia-smi se disponibile; AdapterRAM WMI non usata (limite 32 bit).",
     ));
     Ok(out)
 }
@@ -459,6 +459,10 @@ pub struct Collector {
     gpu_rows: Vec<GpuRow>,
     gpu_warning: String,
     gpu_updated: Option<Instant>,
+    #[cfg(windows)]
+    wddm_worker: crate::gpu_windows::Worker,
+    #[cfg(windows)]
+    sensor_worker: crate::sensors::Worker,
 }
 impl Default for Collector {
     fn default() -> Self {
@@ -476,6 +480,10 @@ fn process_refresh() -> ProcessRefreshKind {
 
 impl Collector {
     pub fn new() -> Self {
+        #[cfg(windows)]
+        let wddm_worker = crate::gpu_windows::Worker::new();
+        #[cfg(windows)]
+        let sensor_worker = crate::sensors::Worker::new();
         let hw = HARDWARE.get_or_init(collect_inventory);
         let mut system = System::new();
         system.refresh_cpu_all();
@@ -522,6 +530,10 @@ impl Collector {
             gpu_warning:
                 "Telemetria GPU in inizializzazione; sensori non disponibili indicati N/D.".into(),
             gpu_updated: None,
+            #[cfg(windows)]
+            wddm_worker,
+            #[cfg(windows)]
+            sensor_worker,
         }
     }
 
@@ -565,6 +577,9 @@ impl Collector {
                     read_bytes_per_sec: read,
                     write_bytes_per_sec: write,
                     is_llm,
+                    gpu_memory_bytes: None,
+                    gpu_shared_memory_bytes: None,
+                    gpu_percent: None,
                 }
             })
             .collect();
@@ -617,7 +632,8 @@ impl Collector {
             .collect();
         self.network_io = network_io;
         networks.sort_by(|a, b| a.name.cmp(&b.name));
-        let sensors: Vec<_> = self
+        #[allow(unused_mut)]
+        let mut sensors: Vec<_> = self
             .components
             .iter()
             .filter_map(|c| {
@@ -642,6 +658,7 @@ impl Collector {
                         {
                             self.gpu_rows.push(GpuRow {
                                 name: name.clone(),
+                                source: "WMI inventory".into(),
                                 ..Default::default()
                             });
                         }
@@ -663,22 +680,14 @@ impl Collector {
             }
         }
         let mut warnings = Vec::new();
+        #[cfg(windows)]
+        let sensor_details;
+        #[cfg(not(windows))]
+        let sensor_details = Vec::new();
         if !warm {
             warnings.push(
                 "Campione CPU in riscaldamento: attendere almeno 250 ms tra i campioni.".into(),
             );
-        }
-        if sensors.is_empty() {
-            warnings.push(
-                "Temperature CPU / scheda madre non esposte dal sistema; nessun valore simulato."
-                    .into(),
-            );
-        }
-        if !self.gpu_warning.is_empty() {
-            warnings.push(self.gpu_warning.clone());
-        }
-        if self.gpu_rows.iter().any(|g| g.utilization.is_none()) {
-            warnings.push("GPU senza provider compatibile: inventario disponibile, carico / VRAM / sensori N/D.".into());
         }
         if self
             .gpu_updated
@@ -691,6 +700,48 @@ impl Collector {
                 g.temperature = None;
                 g.power_watts = None;
             }
+        }
+        #[allow(unused_mut)]
+        let mut gpus = self.gpu_rows.clone();
+        #[cfg(windows)]
+        {
+            let native = self.wddm_worker.latest();
+            let has_native_data = native
+                .gpus
+                .iter()
+                .any(|gpu| gpu.utilization.is_some() || gpu.memory_used.is_some());
+            for process in &mut processes {
+                if let Some(value) = native.processes.get(&process.pid) {
+                    process.gpu_memory_bytes = value.dedicated_bytes;
+                    process.gpu_shared_memory_bytes = value.shared_bytes;
+                    process.gpu_percent = value.utilization;
+                }
+            }
+            if !native.gpus.is_empty() {
+                gpus = merge_gpus(native.gpus, &gpus);
+            }
+            warnings.extend(native.warnings);
+            if has_native_data {
+                warnings.push("GPU Windows: carico = motore più occupato (WDDM), memoria dedicata/condivisa = contatori OS. Temperatura/potenza NVIDIA da nvidia-smi quando disponibili.".into());
+            } else if !self.gpu_warning.is_empty() {
+                warnings.push(self.gpu_warning.clone());
+            }
+            let extended = self.sensor_worker.latest();
+            sensors.extend(extended.temperatures);
+            sensor_details = extended.details;
+            warnings.extend(extended.warnings);
+        }
+        #[cfg(not(windows))]
+        if !self.gpu_warning.is_empty() {
+            warnings.push(self.gpu_warning.clone());
+        }
+        if sensors.is_empty() {
+            warnings.push("Temperature CPU / scheda madre non esposte dal sistema o dal provider opzionale; nessun valore simulato.".into());
+        }
+        if gpus.iter().any(|g| g.utilization.is_none()) {
+            warnings.push(
+                "Una o più GPU non espongono un carico corrente: valore N/D, non zero.".into(),
+            );
         }
         let cpus = self.system.cpus();
         let frequency_mhz = if cpus.is_empty() {
@@ -728,8 +779,9 @@ impl Collector {
             processes,
             disks,
             networks,
-            gpus: self.gpu_rows.clone(),
+            gpus,
             sensors,
+            sensor_details,
             warnings,
         }
     }
@@ -788,9 +840,49 @@ fn fallback_gpus(names: &[String]) -> Vec<GpuRow> {
         .iter()
         .map(|n| GpuRow {
             name: n.clone(),
+            source: if cfg!(windows) {
+                "WMI inventory"
+            } else {
+                "n/d"
+            }
+            .into(),
             ..Default::default()
         })
         .collect()
+}
+
+/// Exact name association only when unambiguous. Two identical adapters must not
+/// inherit the same NVIDIA sensor values because a display name is not an ID.
+#[cfg(any(windows, test))]
+fn merge_gpus(mut native: Vec<GpuRow>, secondary: &[GpuRow]) -> Vec<GpuRow> {
+    let key = |name: &str| name.trim().to_ascii_lowercase();
+    let native_names: Vec<_> = native.iter().map(|gpu| key(&gpu.name)).collect();
+    for gpu in &mut native {
+        let name = key(&gpu.name);
+        let matches: Vec<_> = secondary
+            .iter()
+            .filter(|other| key(&other.name) == name)
+            .collect();
+        if matches.len() == 1 && native_names.iter().filter(|other| **other == name).count() == 1 {
+            let other = matches[0];
+            // The primary label follows the utilization provider; sensor origin
+            // remains documented separately so missing sensors do not change it.
+            if gpu.utilization.is_none() && other.utilization.is_some() {
+                gpu.source = other.source.clone();
+            }
+            gpu.temperature = other.temperature;
+            gpu.power_watts = other.power_watts;
+            gpu.utilization = gpu.utilization.or(other.utilization);
+            gpu.memory_used = gpu.memory_used.or(other.memory_used);
+            gpu.memory_total = gpu.memory_total.or(other.memory_total);
+        }
+    }
+    for gpu in secondary {
+        if !native_names.iter().any(|name| *name == key(&gpu.name)) {
+            native.push(gpu.clone());
+        }
+    }
+    native
 }
 
 struct GpuWorker {
@@ -895,12 +987,14 @@ fn parse_nvidia_csv(output: &str) -> Result<Vec<GpuRow>, String> {
         };
         let memory = |index| number(index).map(|v| (v as f64 * 1024.0 * 1024.0) as u64);
         rows.push(GpuRow {
+            source: "nvidia-smi".into(),
             name: r[0].trim().into(),
             utilization: number(1).filter(|v| *v <= 100.0),
             memory_used: memory(2),
             memory_total: memory(3),
             temperature: number(4),
             power_watts: number(5),
+            shared_memory_used: None,
         });
     }
     if rows.is_empty() {
@@ -913,6 +1007,28 @@ fn parse_nvidia_csv(output: &str) -> Result<Vec<GpuRow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_merge_preserves_os_metrics_and_refuses_ambiguous_name_sensors() {
+        let native = vec![GpuRow {
+            name: "NVIDIA GPU".into(),
+            utilization: Some(5.0),
+            memory_used: Some(100),
+            shared_memory_used: Some(200),
+            ..Default::default()
+        }];
+        let secondary = vec![GpuRow {
+            name: "NVIDIA GPU".into(),
+            utilization: Some(90.0),
+            temperature: Some(60.0),
+            ..Default::default()
+        }];
+        let merged = merge_gpus(native.clone(), &secondary);
+        assert_eq!(merged[0].utilization, Some(5.0));
+        assert_eq!(merged[0].temperature, Some(60.0));
+        assert_eq!(merged[0].shared_memory_used, Some(200));
+        let ambiguous = merge_gpus(vec![native[0].clone(), native[0].clone()], &secondary);
+        assert!(ambiguous.iter().all(|gpu| gpu.temperature.is_none()));
+    }
     #[test]
     fn io_rates_use_actual_elapsed_and_handle_reset_and_first_sample() {
         assert_eq!(
@@ -937,6 +1053,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].memory_used, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(rows[0].utilization, Some(42.0));
+        assert_eq!(rows[0].source, "nvidia-smi");
         assert_eq!(rows[1].utilization, None);
         assert_eq!(rows[1].memory_used, None);
         assert_eq!(rows[1].memory_total, Some(16 * 1024 * 1024 * 1024));

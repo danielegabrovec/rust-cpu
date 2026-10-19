@@ -30,6 +30,12 @@ pub struct Inventory {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessRow {
+    #[serde(default)]
+    pub gpu_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub gpu_shared_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub gpu_percent: Option<f32>,
     pub pid: u32,
     pub name: String,
     pub cpu_percent: f32,
@@ -58,6 +64,10 @@ pub struct NetworkRow {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GpuRow {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub shared_memory_used: Option<u64>,
     pub name: String,
     pub utilization: Option<f32>,
     pub memory_used: Option<u64>,
@@ -72,6 +82,8 @@ pub struct SensorRow {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub sensor_details: Vec<Detail>,
     pub timestamp_unix: u64,
     pub elapsed_secs: f64,
     pub sampling_ms: u64,
@@ -109,6 +121,8 @@ pub struct RuntimeStatus {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BenchmarkResult {
+    #[serde(default)]
+    pub throughput_kind: String,
     pub runtime: String,
     pub model: String,
     pub output_tokens: Option<u64>,
@@ -122,6 +136,8 @@ pub struct BenchmarkResult {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LlmState {
+    #[serde(default)]
+    pub observations: Vec<BenchmarkResult>,
     pub runtimes: Vec<RuntimeStatus>,
     pub benchmark: Option<BenchmarkResult>,
     pub last_probe_unix: u64,
@@ -164,7 +180,7 @@ impl CapacitySettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortColumn {
     #[default]
     Cpu,
@@ -184,6 +200,7 @@ impl SortColumn {
 }
 #[derive(Debug)]
 pub struct UiState {
+    pub workspace: crate::workspace::WorkspaceUi,
     pub process_detail_row: Option<ProcessRow>,
     pub cpu_benchmark: Option<crate::bench::CpuBenchmark>,
     pub cpu_benchmark_confirm: bool,
@@ -210,6 +227,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            workspace: crate::workspace::WorkspaceUi::default(),
             process_detail_row: None,
             cpu_benchmark: None,
             cpu_benchmark_confirm: false,
@@ -284,7 +302,7 @@ pub fn bytes(value: u64) -> String {
         format!("{value} B")
     }
 }
-pub const TABS: [&str; 10] = [
+pub const TABS: [&str; 13] = [
     "Overview",
     "CPU",
     "Mainboard",
@@ -295,6 +313,9 @@ pub const TABS: [&str; 10] = [
     "LLM locali",
     "Capacity Lab",
     "Diagnostica",
+    "Sessioni",
+    "Confronto",
+    "Impostazioni",
 ];
 
 pub fn filtered_processes<'a>(snapshot: &'a Snapshot, state: &UiState) -> Vec<&'a ProcessRow> {

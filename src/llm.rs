@@ -48,7 +48,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<()> {
     local_url(endpoint).map(|_| ())
 }
 
-fn local_url(endpoint: &str) -> Result<Url> {
+pub(crate) fn local_url(endpoint: &str) -> Result<Url> {
     if endpoint.trim() != endpoint || endpoint.chars().any(char::is_control) {
         bail!("Endpoint non valido: usare un'origine HTTP loopback senza spazi");
     }
@@ -94,8 +94,63 @@ fn local_url(endpoint: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn client(probe: bool) -> Result<Client> {
+pub(crate) fn canonical_runtime(runtime: &str) -> Result<&'static str> {
+    match runtime
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "")
+        .as_str()
+    {
+        "ollama" => Ok("Ollama"),
+        "lmstudio" => Ok("LM Studio"),
+        "llama.cpp" | "llamacpp" => Ok("llama.cpp"),
+        _ => bail!("Runtime non supportato: scegliere Ollama, LM Studio o llama.cpp"),
+    }
+}
+
+fn authorization(token: Option<String>) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        if token.len() > 8192 || token.chars().any(char::is_control) {
+            bail!("Token del runtime non valido; controllare la variabile d'ambiente");
+        }
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow!("Token del runtime non valido"))?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
+pub(crate) fn environment_token(variable: &'static str) -> Result<Option<String>> {
+    match std::env::var(variable) {
+        Ok(token) => Ok((!token.is_empty()).then_some(token)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("La variabile {variable} deve contenere un token Unicode valido")
+        }
+    }
+}
+
+pub(crate) fn runtime_token(runtime: &str) -> Result<Option<String>> {
+    let variable = match canonical_runtime(runtime)? {
+        "Ollama" => "RUST_CPU_OLLAMA_TOKEN",
+        "LM Studio" => "RUST_CPU_LM_STUDIO_TOKEN",
+        _ => "RUST_CPU_LLAMA_CPP_TOKEN",
+    };
+    environment_token(variable)
+}
+
+pub(crate) fn client_with_token(probe: bool, token: Option<String>) -> Result<Client> {
+    build_client(probe, authorization(token)?)
+}
+
+pub(crate) fn client_for(probe: bool, runtime: &str) -> Result<Client> {
+    client_with_token(probe, runtime_token(runtime)?)
+}
+
+fn build_client(probe: bool, headers: reqwest::header::HeaderMap) -> Result<Client> {
     Client::builder()
+        .default_headers(headers)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(1))
@@ -114,7 +169,7 @@ fn executor() -> Result<tokio::runtime::Runtime> {
 }
 
 #[derive(Debug)]
-enum Issue {
+pub(crate) enum Issue {
     Offline,
     Timeout,
     Http(u16),
@@ -149,7 +204,7 @@ fn transport_error(error: reqwest::Error) -> Issue {
     }
 }
 
-async fn cancellable<T>(
+pub(crate) async fn cancellable<T>(
     future: impl Future<Output = reqwest::Result<T>>,
     cancel: &AtomicBool,
     deadline: Instant,
@@ -206,7 +261,7 @@ async fn response_json(
     Ok(value)
 }
 
-async fn get_json(
+pub(crate) async fn get_json(
     client: &Client,
     base: &Url,
     path: &str,
@@ -282,6 +337,46 @@ fn embedding_only(value: &Value) -> bool {
                 .next()
                 .is_some_and(|name| name.eq_ignore_ascii_case("nomic-embed-text"))
         })
+}
+
+pub(crate) async fn ensure_local_ollama_model(
+    client: &Client,
+    base: &Url,
+    model: &str,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<()> {
+    if model.to_ascii_lowercase().contains("cloud") {
+        bail!("Sono consentiti soltanto modelli Ollama locali");
+    }
+    let tags = get_json(client, base, "/api/tags", cancel, deadline).await?;
+    let tagged = if model
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| !name.contains(':'))
+    {
+        format!("{model}:latest")
+    } else {
+        model.to_string()
+    };
+    let local = model_array(&tags, "models")?
+        .iter()
+        .find(|row| model_id(row).is_some_and(|name| name == model || name == tagged));
+    if local.is_some_and(embedding_only) {
+        bail!("Modello embedding non generativo: scegliere un modello di generazione testuale");
+    }
+    if !local.is_some_and(|row| {
+        !remote_model(row)
+            && row
+                .get("size")
+                .and_then(Value::as_u64)
+                .is_some_and(|size| size > 0)
+    }) {
+        bail!(
+            "Il modello deve risultare installato localmente; modelli remoti o non verificabili esclusi"
+        );
+    }
+    Ok(())
 }
 
 fn ollama_models(
@@ -391,7 +486,7 @@ fn probe(name: &str, endpoint: &str) -> RuntimeStatus {
     };
     let result = (|| -> Result<()> {
         let executor = executor()?;
-        let client = client(true)?;
+        let client = client_for(true, name)?;
         executor
             .block_on(async {
                 let cancel = AtomicBool::new(false);
@@ -519,6 +614,7 @@ pub fn probe_all(endpoints: &Endpoints) -> LlmState {
             .unwrap_or_default()
             .as_secs(),
         benchmark: None,
+        ..Default::default()
     }
 }
 
@@ -539,7 +635,11 @@ struct StreamStats {
 fn rate(count: Option<u64>, seconds: Option<f64>) -> Option<f64> {
     let count = count?;
     let seconds = seconds?;
-    (seconds.is_finite() && seconds > 0.0).then_some(count as f64 / seconds)
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let value = count as f64 / seconds;
+    value.is_finite().then_some(value)
 }
 
 fn number(value: &Value, key: &str) -> Option<f64> {
@@ -556,13 +656,37 @@ impl StreamStats {
         ollama: bool,
         start: Instant,
     ) -> std::result::Result<(), Issue> {
-        if !value.is_object() || value.get("error").is_some() {
+        let failed_reason = value
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| matches!(reason, "error" | "cancelled" | "canceled"))
+            || value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| {
+                                matches!(reason, "error" | "cancelled" | "canceled")
+                            })
+                    })
+                });
+        if !value.is_object() || value.get("error").is_some() || failed_reason {
             return Err(Issue::Malformed);
         }
         let has_token = if ollama {
-            ["response", "thinking"].iter().any(|field| {
+            [
+                "/response",
+                "/thinking",
+                "/message/content",
+                "/message/thinking",
+            ]
+            .iter()
+            .any(|field| {
                 value
-                    .get(field)
+                    .pointer(field)
                     .and_then(Value::as_str)
                     .is_some_and(|s| !s.is_empty())
             })
@@ -576,6 +700,8 @@ impl StreamStats {
                             "/delta/content",
                             "/delta/reasoning_content",
                             "/delta/reasoning",
+                            "/message/content",
+                            "/message/reasoning_content",
                         ]
                         .iter()
                         .any(|path| {
@@ -661,6 +787,7 @@ struct Decoder {
     event_data: String,
     total: usize,
     ollama: bool,
+    maximum: usize,
 }
 impl Decoder {
     fn new(ollama: bool) -> Self {
@@ -669,6 +796,7 @@ impl Decoder {
             event_data: String::new(),
             total: 0,
             ollama,
+            maximum: MAX_STREAM,
         }
     }
     fn feed(
@@ -678,7 +806,7 @@ impl Decoder {
         start: Instant,
     ) -> std::result::Result<(), Issue> {
         self.total = self.total.saturating_add(data.len());
-        if self.total > MAX_STREAM {
+        if self.total > self.maximum {
             return Err(Issue::TooLarge);
         }
         for &byte in data {
@@ -764,6 +892,97 @@ impl Decoder {
     }
 }
 
+/// Ephemeral parser shared with the explicitly enabled observation proxy.
+/// Streaming retains one bounded framing buffer; nonstreaming retains a bounded
+/// JSON response until validation. Neither is persisted or passed to callbacks.
+pub(crate) struct ObservationParser {
+    decoder: Decoder,
+    stats: StreamStats,
+    json_body: Vec<u8>,
+    streaming: bool,
+    start: Instant,
+}
+
+impl ObservationParser {
+    pub(crate) fn new(ollama: bool, streaming: bool, start: Instant) -> Self {
+        let mut decoder = Decoder::new(ollama);
+        decoder.maximum = 16 * 1024 * 1024;
+        Self {
+            decoder,
+            stats: StreamStats::default(),
+            json_body: Vec::new(),
+            streaming,
+            start,
+        }
+    }
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.streaming {
+            self.decoder.feed(bytes, &mut self.stats, self.start)?;
+        } else {
+            if self.json_body.len().saturating_add(bytes.len()) > MAX_BODY {
+                bail!("Risposta JSON oltre il limite");
+            }
+            self.json_body.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(mut self, runtime: &str, model: &str) -> Result<BenchmarkResult> {
+        if self.streaming {
+            self.decoder.finish(&mut self.stats, self.start)?;
+        } else {
+            let value: Value = serde_json::from_slice(&self.json_body)
+                .map_err(|_| anyhow!("Risposta JSON non valida"))?;
+            self.stats.event(&value, self.decoder.ollama, self.start)?;
+            if !self.stats.finished && !self.stats.finish_reason {
+                bail!("Risposta inferenza incompleta");
+            }
+            // A buffered JSON response does not expose arrival of the first token.
+            self.stats.first_token_ms = None;
+        }
+        let wall_seconds = self.start.elapsed().as_secs_f64();
+        let mut note = "Richiesta esterna osservata tramite proxy locale esplicito; non è un benchmark sintetico. ".to_string();
+        if self.stats.native_timing {
+            note.push_str("Decode da contatori/tempi nativi. ");
+        } else {
+            self.stats.generation_rate = rate(self.stats.output_tokens, Some(wall_seconds));
+            note.push_str("Tok/s end-to-end = usage output / durata proxy, include prefill, coda e caricamento. ");
+        }
+        if self.stats.output_tokens.is_none() {
+            note.push_str("Token non forniti: conteggio e velocità n/d. ");
+        }
+        if self.decoder.ollama && self.stats.cached_prompt.is_none() {
+            note.push_str("Prefill n/d: contatore cache assente. ");
+        }
+        if let Some(cached) = self.stats.cached_prompt {
+            note.push_str(&format!("Token in cache: {cached}. "));
+        }
+        if !self.streaming {
+            note.push_str("TTFT n/d per risposta non streaming. ");
+        }
+        note.push_str("TTFT e durata includono lettura richiesta e verifiche proxy. Prompt e testo generato non conservati; richieste che non attraversano questo proxy non sono osservate.");
+        Ok(BenchmarkResult {
+            runtime: canonical_runtime(runtime)?.into(),
+            model: safe_text(model),
+            throughput_kind: if self.stats.generation_rate.is_none() {
+                "unavailable"
+            } else if self.stats.native_timing {
+                "native_decode"
+            } else {
+                "end_to_end"
+            }
+            .into(),
+            output_tokens: self.stats.output_tokens,
+            prompt_tokens: self.stats.prompt_tokens,
+            wall_seconds,
+            generation_tokens_per_sec: self.stats.generation_rate,
+            prompt_tokens_per_sec: self.stats.prompt_rate,
+            time_to_first_token_ms: self.stats.first_token_ms,
+            load_ms: self.stats.load_ms,
+            note,
+        })
+    }
+}
+
 /// Run a single fixed Italian synthetic prompt, with at most 64 output tokens.
 /// The caller must explicitly request inference. No arbitrary user prompt or
 /// generated text is retained. Cancellation drops the in-flight connection.
@@ -793,19 +1012,11 @@ pub fn benchmark(
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     let executor = executor()?;
-    let client = client(false)?;
+    let client = client_for(false, runtime_name)?;
     executor.block_on(async {
         let ollama = runtime_name == "Ollama";
         if ollama {
-            if model.to_ascii_lowercase().contains("cloud") { bail!("Benchmark consentito soltanto su modelli Ollama locali"); }
-            let tags = get_json(&client, &base, "/api/tags", &cancel, deadline).await?;
-            let local = model_array(&tags, "models")?.iter().find(|row| model_id(row) == Some(model));
-            if local.is_some_and(embedding_only) {
-                bail!("Modello embedding non generativo: scegliere un modello di generazione testuale");
-            }
-            if !local.is_some_and(|row| !remote_model(row) && row.get("size").and_then(Value::as_u64).is_some_and(|n| n > 0)) {
-                bail!("Il modello deve risultare installato localmente; modelli remoti o non verificabili esclusi");
-            }
+            ensure_local_ollama_model(&client, &base, model, &cancel, deadline).await?;
         }
         let tokens = max_tokens.clamp(1, 64);
         let body = if ollama {
@@ -838,6 +1049,7 @@ pub fn benchmark(
         note.push_str("Prompt sintetico fisso, seed Ollama 42, massimo 64 token; nessuna risposta conservata. Verificare l'instradamento del runtime locale.");
         Ok(BenchmarkResult {
             runtime: runtime_name.into(), model: safe_text(model), output_tokens: stats.output_tokens,
+            throughput_kind: if stats.generation_rate.is_none() { "unavailable" } else if stats.native_timing { "native_decode" } else { "end_to_end" }.into(),
             prompt_tokens: stats.prompt_tokens, wall_seconds,
             generation_tokens_per_sec: stats.generation_rate, prompt_tokens_per_sec: stats.prompt_rate,
             time_to_first_token_ms: stats.first_token_ms, load_ms: stats.load_ms, note,
@@ -1324,5 +1536,36 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert!(requests[0].starts_with("GET /api/tags "));
         }
+    }
+
+    #[test]
+    fn runtime_bearer_auth_is_sensitive_and_reaches_only_local_http() {
+        let secret = "synthetic-test-token-not-a-real-key";
+        let headers = authorization(Some(secret.into())).unwrap();
+        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        let (endpoint, requests, task) = mock(vec![json_response(r#"{"data":[]}"#)]);
+        let client = build_client(true, headers).unwrap();
+        let executor = executor().unwrap();
+        let base = local_url(&endpoint).unwrap();
+        let value = executor
+            .block_on(get_json(
+                &client,
+                &base,
+                "/v1/models",
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(2),
+            ))
+            .unwrap();
+        assert!(value["data"].is_array());
+        task.join().unwrap();
+        assert!(
+            requests
+                .recv()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {secret}"))
+        );
+        let invalid = authorization(Some("private\r\nInjected: no".into())).unwrap_err();
+        assert!(!invalid.to_string().contains("private"));
     }
 }

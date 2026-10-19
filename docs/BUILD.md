@@ -95,11 +95,11 @@ Lo script `scripts/package.ps1`:
 4. Richiama `installer/rust-cpu.nsi` passando `/DVERSION=<versione>` a NSIS.
 5. Scrive `artifacts/SHA256SUMS.txt` con gli hash SHA-256 dello ZIP e del setup.
 
-Per la versione `0.1.0` i file prodotti si chiamano:
+Per la versione `0.2.0` i file prodotti si chiamano:
 
 ```text
-artifacts/rust-cpu-0.1.0-windows-x64-portable.zip
-artifacts/rust-cpu-0.1.0-windows-x64-setup.exe
+artifacts/rust-cpu-0.2.0-windows-x64-portable.zip
+artifacts/rust-cpu-0.2.0-windows-x64-setup.exe
 artifacts/SHA256SUMS.txt
 ```
 
@@ -138,7 +138,7 @@ La versione dell'applicazione e degli export viene compilata da `Cargo.toml`
 tramite `CARGO_PKG_VERSION`. Il nome del setup e le stringhe di versione NSIS
 ricevono `VERSION` dallo script di packaging. Prima di una release verificare
 anche la versione numerica Windows `VIProductVersion` nel sorgente NSIS: il
-formato richiesto è composto da quattro numeri, per esempio `0.1.0.0`.
+formato richiesto è composto da quattro numeri, per esempio `0.2.0.0`.
 
 Prima di caricare una release:
 
@@ -152,13 +152,13 @@ I comandi seguenti sono un esempio manuale per una release già revisionata;
 richiedono GitHub CLI autenticata e il remote Git corretto:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
-gh release create v0.1.0 `
-  .\artifacts\rust-cpu-0.1.0-windows-x64-setup.exe `
-  .\artifacts\rust-cpu-0.1.0-windows-x64-portable.zip `
+git tag v0.2.0
+git push origin v0.2.0
+gh release create v0.2.0 `
+  .\artifacts\rust-cpu-0.2.0-windows-x64-setup.exe `
+  .\artifacts\rust-cpu-0.2.0-windows-x64-portable.zip `
   .\artifacts\SHA256SUMS.txt `
-  --verify-tag --title 'RUST-CPU 0.1.0' --notes-file .\CHANGELOG.md
+  --verify-tag --title 'RUST-CPU 0.2.0' --notes-file .\CHANGELOG.md
 ```
 
 La disponibilità di un hash non equivale a una firma del produttore. Il codice
@@ -173,8 +173,9 @@ firmato senza una verifica separata del file finale.
 | Carico CPU/RAM/processi/dischi/rete | Provider sysinfo | Provider sysinfo; disponibilità dipendente dal sistema |
 | CPUID dettagliato | x86/x86-64 | x86/x86-64 |
 | Scheda madre, BIOS, moduli DIMM, GPU di inventario | WMI, con timeout iniziale | Nessun provider WMI |
-| GPU NVIDIA live | `nvidia-smi` quando disponibile | `nvidia-smi` quando disponibile |
-| GPU AMD/Intel live | Nessun provider dinamico dedicato | Nessun provider dinamico dedicato |
+| GPU NVIDIA live | WDDM / PDH; sensori aggiuntivi `nvidia-smi` quando disponibile | `nvidia-smi` quando disponibile |
+| GPU AMD/Intel live | WDDM / PDH con mappatura DXGI; contatori dipendenti dal driver | Nessun provider dinamico dedicato |
+| Temperature/tensioni avanzate | WMI LibreHardwareMonitor già in esecuzione, opzionale | Sensori sysinfo disponibili dal sistema |
 | Installer distribuito | NSIS per utente x64 | Nessun pacchetto Linux creato da NSIS |
 
 macOS, Windows ARM64, target Linux non x86 e hardware con gruppi processori
@@ -182,6 +183,8 @@ particolari richiedono verifiche dedicate prima di dichiarare supporto provato.
 La compilazione condizionale evita WMI fuori da Windows e CPUID fuori da x86;
 questo non sostituisce un test sull'hardware corrispondente.
 
-Clock OS nominali, sensori non esposti, contatori non accessibili e assenza di
-`nvidia-smi` producono limiti dichiarati o dati mancanti. Il programma non include
-un driver kernel per SPD, timing RAM, tensioni, SMART o sensori proprietari.
+Clock OS nominali, sensori non esposti e contatori non accessibili producono
+limiti dichiarati o dati mancanti. Il programma non include un driver kernel
+per SPD, timing RAM, SMART o sensori proprietari. I dettagli sui provider WDDM,
+sulla memoria dedicata/condivisa e sulle tensioni live opzionali sono in
+[HARDWARE.md](HARDWARE.md).

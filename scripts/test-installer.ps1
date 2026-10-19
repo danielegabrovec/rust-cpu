@@ -1,9 +1,10 @@
 #requires -Version 7.0
-param([string]$Installer = 'artifacts\rust-cpu-0.1.0-windows-x64-setup.exe')
+param([string]$Installer)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $projectRoot
 try {
+    if (-not $Installer) { $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json; $Installer = "artifacts\rust-cpu-$($metadata.packages[0].version)-windows-x64-setup.exe" }
     $registryKey = 'HKCU:\Software\RUST-CPU'
     $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\RUST-CPU'
     $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'RUST-CPU'
@@ -24,10 +25,13 @@ try {
     & $executable --version
     if ($LASTEXITCODE -ne 0) { throw 'Eseguibile installato non avviabile' }
     $reportPath = Join-Path $testRoot ('installed-' + [guid]::NewGuid().ToString('N') + '.json')
-    & $executable --snapshot $reportPath --no-llm --interval-ms 500
+    $databasePath = Join-Path $testRoot ('installed-' + [guid]::NewGuid().ToString('N') + '.sqlite3')
+    & $executable --database $databasePath --save-session 'Installer smoke' --samples 2 --snapshot $reportPath --no-llm --interval-ms 500
     if ($LASTEXITCODE -ne 0) { throw 'Snapshot da eseguibile installato fallito' }
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
     if ($report.snapshot.memory_total -le 0 -or $report.snapshot.processes.Count -eq 0) { throw 'Telemetria installata non valida' }
+    & $executable --database $databasePath --db-check
+    if ($LASTEXITCODE -ne 0) { throw 'Integrita SQLite installata fallita' }
     $process = Start-Process -FilePath $uninstaller -ArgumentList "/S _?=$installDir" -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Disinstallazione exit code $($process.ExitCode)" }
     # _?= keeps the uninstaller in place so Wait observes the actual uninstall process.
@@ -38,5 +42,6 @@ try {
     if (Test-Path -LiteralPath $uninstaller) { Remove-Item -LiteralPath $uninstaller -Force }
     if (Test-Path -LiteralPath $installDir) { [System.IO.Directory]::Delete($installDir, $false) }
     if ((Test-Path -LiteralPath $registryKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $startMenu) -or (Test-Path -LiteralPath $installDir)) { throw 'Residui installazione rilevati' }
-    Write-Host 'Installer verificato: installazione, avvio, snapshot reale, disinstallazione e pulizia.'
+    if (-not (Test-Path -LiteralPath $databasePath)) { throw 'La disinstallazione ha eliminato i dati utente' }
+    Write-Host 'Installer verificato: installazione, sessione SQLite reale, integrita, disinstallazione e dati conservati.'
 } finally { Pop-Location }

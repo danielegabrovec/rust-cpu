@@ -13,9 +13,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Build fallita' }
     $binary = if ($Release) { '.\target\release\rust-cpu.exe' } else { '.\target\debug\rust-cpu.exe' }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-ffff'
-    & $binary --snapshot "test-output\snapshot-$stamp.json" --record "test-output\session-$stamp.csv" --samples 3 --no-llm
+    $verificationDb = Join-Path (Get-Location) "test-output\verify-$stamp.sqlite3"
+    & $binary --database $verificationDb --snapshot "test-output\snapshot-$stamp.json" --record "test-output\session-$stamp.csv" --samples 3 --no-llm
     if ($LASTEXITCODE -ne 0) { throw 'Smoke test dati reali fallito' }
-    & $binary --render "test-output\overview-$stamp.txt" --no-llm
+    & $binary --database $verificationDb --render "test-output\overview-$stamp.txt" --no-llm
     if ($LASTEXITCODE -ne 0) { throw 'Smoke test TUI fallito' }
     Write-Host 'Verifiche completate. I report locali non sono versionati.'
 } finally { Pop-Location }

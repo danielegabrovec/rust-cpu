@@ -7,7 +7,11 @@
 //! Lab, where they edit the field selected with `[`/`]`. `b` requests an
 //! inference benchmark, Enter confirms, Esc returns, `?` opens help, `q` exits.
 
-use crate::model::*;
+use crate::{
+    model::*,
+    settings::SETTINGS_FIELDS,
+    storage::{ComparisonMetric, SavedBenchmark, SessionComparison, SessionSummary},
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -145,7 +149,7 @@ fn optional_percent(value: Option<f32>) -> String {
 
 /// Sidebar hit testing uses the exact same geometry as [`render`].
 pub fn sidebar_tab_at(width: u16, height: u16, x: u16, y: u16) -> Option<usize> {
-    let step = if height >= 28 { 2 } else { 1 };
+    let step = if height >= 34 { 2 } else { 1 };
     if width >= 100
         && height >= 24
         && (1..21).contains(&x)
@@ -214,42 +218,7 @@ pub fn render(
             Direction::Vertical,
             &[Constraint::Length(3), Constraint::Min(1)],
         );
-        let titles = TABS
-            .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                let label = if area.width < 90 {
-                    match i {
-                        0 => "Vista",
-                        2 => "MB",
-                        3 => "RAM",
-                        5 => "I/O",
-                        6 => "Proc",
-                        7 => "LLM",
-                        8 => "Lab",
-                        9 => "Diag",
-                        _ => label,
-                    }
-                } else {
-                    label
-                };
-                Line::from(format!("{} {label}", (i + 1) % 10))
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Tabs::new(titles)
-                .select(state.active_tab.min(9))
-                .divider(" ")
-                .padding("", "")
-                .style(p.muted())
-                .highlight_style(p.accent().bg(p.elevated))
-                .block(
-                    Block::default()
-                        .borders(Borders::BOTTOM)
-                        .border_style(Style::default().fg(p.border)),
-                ),
-            rows[0],
-        );
+        compact_navigation(frame, rows[0], state, p);
         rows[1]
     };
     let main = padded(main, 1, 0);
@@ -263,7 +232,11 @@ pub fn render(
         6 => process_page(frame, main, snapshot, state, p),
         7 => llm_page(frame, main, llm, state, p),
         8 => capacity_page(frame, main, snapshot, state, p),
-        _ => diagnostics_page(frame, main, inventory, snapshot, llm, state, p),
+        9 => diagnostics_page(frame, main, inventory, snapshot, llm, state, p),
+        10 => sessions_page(frame, main, state, p),
+        11 => comparison_page(frame, main, state, p),
+        12 => settings_page(frame, main, state, p),
+        _ => {}
     }
     footer(frame, areas[2], state, p);
     if state.help {
@@ -276,11 +249,96 @@ pub fn render(
         benchmark_modal(frame, area, llm, state, p);
     }
     if state.cpu_benchmark_confirm {
-        cpu_benchmark_modal(frame, area, p);
+        cpu_benchmark_modal(frame, area, state, p);
+    }
+    if state.workspace.name_edit.is_some() {
+        session_name_modal(frame, area, state, p);
+    }
+    if state.workspace.delete_confirm {
+        session_delete_modal(frame, area, state, p);
     }
 }
 
+fn tab_shortcut(index: usize) -> String {
+    match index {
+        0..=8 => (index + 1).to_string(),
+        9 => "0".into(),
+        10 => "F2".into(),
+        11 => "F3".into(),
+        12 => "F4".into(),
+        _ => String::new(),
+    }
+}
+
+fn compact_navigation(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
+    let workspace = state.active_tab >= 10;
+    let start = if workspace {
+        10
+    } else if area.width < 64 {
+        state.active_tab.saturating_sub(2).min(5)
+    } else {
+        0
+    };
+    let end = if workspace {
+        TABS.len()
+    } else if area.width < 64 {
+        (start + 5).min(10)
+    } else {
+        10
+    };
+    let titles = (start..end)
+        .map(|index| {
+            let label = match index {
+                0 => "Vista",
+                2 => "MB",
+                3 => "RAM",
+                5 => "I/O",
+                6 => "Proc",
+                7 => "LLM",
+                8 => "Lab",
+                9 => "Diag",
+                _ => TABS[index],
+            };
+            Line::from(format!("{} {label}", tab_shortcut(index)))
+        })
+        .collect::<Vec<_>>();
+    let rows = split(
+        area,
+        Direction::Vertical,
+        &[Constraint::Length(1), Constraint::Min(1)],
+    );
+    frame.render_widget(
+        Tabs::new(titles)
+            .select(
+                state
+                    .active_tab
+                    .saturating_sub(start)
+                    .min(end.saturating_sub(start + 1)),
+            )
+            .divider(" ")
+            .padding("", "")
+            .style(p.muted())
+            .highlight_style(p.accent().bg(p.elevated)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(if workspace {
+            "←→ / Tab: 13 viste · 1…9,0 hardware · F2/F3/F4 archivio"
+        } else {
+            "←→ / Tab: 13 viste · F2 Sessioni · F3 Confronto · F4 Opzioni"
+        })
+        .style(p.muted())
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(p.border)),
+        ),
+        rows[1],
+    );
+}
+
 fn header(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, state: &UiState, p: Palette) {
+    let workspace_page = state.active_tab >= 10;
     let mut line = vec![
         Span::styled(" RUST", p.accent()),
         Span::styled("-CPU ", p.text().add_modifier(Modifier::BOLD)),
@@ -290,19 +348,45 @@ fn header(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, state: &UiStat
         line.push(Span::styled("       ", p.muted()));
     }
     line.push(Span::styled(
-        if state.paused { "  PAUSA " } else { "  LIVE " },
+        if state.active_tab == 10 {
+            "  ARCHIVIO "
+        } else if state.active_tab == 11 {
+            "  CONFRONTO "
+        } else if state.active_tab == 12 {
+            "  CONFIG "
+        } else if state.workspace.loaded.is_some() {
+            "  REPLAY "
+        } else if state.paused {
+            "  PAUSA "
+        } else {
+            "  LIVE "
+        },
         Style::default()
-            .fg(if state.paused { p.amber } else { p.green })
+            .fg(if workspace_page || state.workspace.loaded.is_some() {
+                p.cyan
+            } else if state.paused {
+                p.amber
+            } else {
+                p.green
+            })
             .add_modifier(Modifier::BOLD),
     ));
     if state.recording {
         line.push(Span::styled(" ● REC", Style::default().fg(p.red)));
     }
-    line.push(Span::styled(
-        format!("  {:.1}s", state.tick_ms as f64 / 1000.0),
-        p.muted(),
-    ));
-    if area.width >= 100 {
+    if !state.workspace.alerts.is_empty() {
+        line.push(Span::styled(
+            format!(" !{} eventi", state.workspace.alerts.len()),
+            Style::default().fg(p.amber).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !workspace_page {
+        line.push(Span::styled(
+            format!("  {:.1}s", state.tick_ms as f64 / 1000.0),
+            p.muted(),
+        ));
+    }
+    if area.width >= 100 && !workspace_page {
         line.push(Span::styled(
             format!(
                 "  |  CPU {:4.1}%  RAM {:4.1}%",
@@ -313,7 +397,10 @@ fn header(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot, state: &UiStat
         ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(line)).block(
+        Paragraph::new(vec![Line::from(line),Line::from(Span::styled(if let Some(session)=&state.workspace.loaded{
+            format!(" REPLAY #{} {} · campione {}/{} caricati ({} totali) · [ ] scorri · l live",session.summary.id,ellipsize(&clean(&session.summary.name),24),state.workspace.replay_index.saturating_add(1).min(session.samples.len()),session.samples.len(),session.total_samples)
+        }else if let Some(id)=state.workspace.active_session{format!(" SQLite #{id} · sessione attiva · F2 archivio · F3 confronto · F4 preferenze")}
+        else{" SQLite · F2 sessioni · F3 confronto · F4 preferenze · F6 backup database".into()},p.muted()))]).block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(Style::default().fg(p.border)),
@@ -342,7 +429,7 @@ fn sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
                 if active { "▌ " } else { "  " },
                 Style::default().fg(p.cyan),
             ),
-            Span::styled(format!("{} ", (index + 1) % 10), p.muted()),
+            Span::styled(format!("{} ", tab_shortcut(index)), p.muted()),
             Span::styled(
                 (*title).to_string(),
                 if active {
@@ -352,12 +439,12 @@ fn sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
                 },
             ),
         ]));
-        if area.height >= 23 {
+        if area.height >= 29 {
             lines.push(Line::default());
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
-    if area.height >= 31 {
+    if area.height >= 36 {
         let info = Rect::new(inner.x, area.bottom().saturating_sub(6), inner.width, 5);
         frame.render_widget(
             Paragraph::new(vec![
@@ -377,21 +464,51 @@ fn sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
 fn footer(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
     let context = if state.filter_edit {
         "Cerca: digita · Invio applica · Esc chiude"
+    } else if state.active_tab == 10 {
+        "↑↓ sessione  Invio replay  a A  b B  c confronta  n nome  Del elimina"
+    } else if state.active_tab == 11 {
+        "↑↓ scorri  F2 scegli A/B  l live  F6 backup  ? guida  q esci"
+    } else if state.active_tab == 12 {
+        "↑↓ campo  + − modifica  salvataggio automatico  F6 backup  ? guida"
+    } else if state.workspace.loaded.is_some() {
+        "[ ] campione  l torna live  F2 archivio  Tab pagina  ? guida  q esci"
     } else if state.active_tab == 8 {
         "[ ] campo  + − modifica  Tab pagina  ? guida  q esci"
     } else if state.active_tab == 1 {
-        "↑↓ scorri  x benchmark CPU  Tab pagina  Spazio pausa  ? guida  q esci"
+        "↑↓ scorri  x CPU  Shift+X ripeti  c annulla  Tab pagina  ? guida"
     } else if state.active_tab == 6 {
         "↑↓ seleziona  / cerca  s ordina  a verso  Invio dettagli  ? guida"
     } else if state.active_tab == 7 {
-        "↑↓ modello  b benchmark  Tab pagina  e esporta  ? guida  q esci"
+        "↑↓ modello  b misura  Shift+B ripeti  c annulla  F5 aggiorna  ? guida"
     } else {
         "Tab pagina  ↑↓ scorri  Spazio pausa  e esporta  r registra  ? guida  q esci"
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(context, p.muted())),
-            Line::from(Span::styled(available(&state.status).to_string(), p.text())),
+            if let Some(alert) = state.workspace.alerts.last() {
+                Line::from(vec![
+                    Span::styled(
+                        ellipsize(
+                            &available(&state.status),
+                            (area.width / 2).saturating_sub(2) as usize,
+                        ),
+                        p.text(),
+                    ),
+                    Span::styled(
+                        format!(
+                            " | ! {}",
+                            ellipsize(
+                                &clean(&alert.message),
+                                (area.width / 2).saturating_sub(4) as usize
+                            )
+                        ),
+                        Style::default().fg(p.amber),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled(available(&state.status), p.text()))
+            },
         ]),
         area,
     );
@@ -541,10 +658,15 @@ fn overview(
     if compact {
         let text = vec![
             Line::from(format!(
-                "{} core / {} thread · {} processi",
+                "{} core / {} thread · {} processi{}",
                 inventory.physical_cores,
                 inventory.logical_cores,
-                snapshot.processes.len()
+                snapshot.processes.len(),
+                if state.workspace.loaded.is_some() {
+                    " LLM archiviati"
+                } else {
+                    ""
+                }
             )),
             Line::from(format!(
                 "GPU: {}",
@@ -652,10 +774,15 @@ fn overview(
             Span::raw(available(&inventory.os).to_string()),
         ]),
         Line::from(format!(
-            "{} core · {} thread · {} processi",
+            "{} core · {} thread · {} processi{}",
             inventory.physical_cores,
             inventory.logical_cores,
-            snapshot.processes.len()
+            snapshot.processes.len(),
+            if state.workspace.loaded.is_some() {
+                " LLM archiviati"
+            } else {
+                ""
+            }
         )),
         Line::from(format!(
             "LLM: {} processi · RAM {}",
@@ -823,6 +950,23 @@ fn cpu_page(
     history: &History,
     p: Palette,
 ) {
+    let mut cpu_details = inventory.cpu.clone();
+    cpu_details.extend(snapshot.sensor_details.iter().cloned());
+    cpu_details.extend(
+        snapshot
+            .sensors
+            .iter()
+            .filter(|sensor| {
+                let name = sensor.name.to_lowercase();
+                name.contains("cpu") || name.contains("package") || name.contains("tctl")
+            })
+            .map(|sensor| {
+                Detail::new(
+                    format!("Temperatura · {}", sensor.name),
+                    format!("{:.1} °C (lettura live)", sensor.temperature),
+                )
+            }),
+    );
     let rows = split(
         area,
         Direction::Vertical,
@@ -867,14 +1011,14 @@ fn cpu_page(
         );
         clamp_scroll(
             state,
-            detail_max_offset(cols[0], &inventory.cpu)
+            detail_max_offset(cols[0], &cpu_details)
                 .max(core_max_offset(right[0], snapshot.per_core.len())),
         );
         detail_table(
             frame,
             cols[0],
             "Caratteristiche CPUID / sistema",
-            &inventory.cpu,
+            &cpu_details,
             state.offset,
             p,
         );
@@ -887,12 +1031,12 @@ fn cpu_page(
         );
         graph(frame, right[1], "Storico CPU %", &history.cpu, p.cyan, p);
     } else {
-        clamp_scroll(state, detail_max_offset(rows[2], &inventory.cpu));
+        clamp_scroll(state, detail_max_offset(rows[2], &cpu_details));
         detail_table(
             frame,
             rows[2],
             "Caratteristiche CPU · ↑↓ scorri",
-            &inventory.cpu,
+            &cpu_details,
             state.offset,
             p,
         );
@@ -1087,17 +1231,29 @@ fn gpu_page(
             p,
         );
     } else {
-        clamp_scroll(
-            state,
-            snapshot
-                .gpus
-                .len()
-                .saturating_sub(rows[1].height.saturating_sub(4).max(2) as usize / 2),
-        );
-        let offset = state.offset as usize;
+        let panels = if rows[1].height >= 14 {
+            split(
+                rows[1],
+                Direction::Vertical,
+                &[Constraint::Length(8), Constraint::Min(4)],
+            )
+        } else {
+            vec![rows[1]]
+        };
+        let gpu_max = snapshot
+            .gpus
+            .len()
+            .saturating_sub(panels[0].height.saturating_sub(4).max(2) as usize / 2);
+        let detail_max = panels
+            .get(1)
+            .map(|area| detail_max_offset(*area, &inventory.graphics))
+            .unwrap_or(0);
+        clamp_scroll(state, gpu_max.max(detail_max));
+        let offset = (state.offset as usize).min(gpu_max);
         let gpu_rows = snapshot.gpus.iter().skip(offset).map(|g| {
             let vram = match (g.memory_used, g.memory_total) {
                 (Some(u), Some(t)) => format!("{} / {}", bytes(u), bytes(t)),
+                (Some(u), None) => format!("{} / n/d", bytes(u)),
                 (_, Some(t)) => format!("totale {}", bytes(t)),
                 _ => "n/d".into(),
             };
@@ -1105,6 +1261,9 @@ fn gpu_page(
                 clean(&g.name),
                 optional_percent(g.utilization),
                 vram,
+                g.shared_memory_used
+                    .map(bytes)
+                    .unwrap_or_else(|| "n/d".into()),
                 g.temperature
                     .map(|v| format!("{v:.0} °C"))
                     .unwrap_or_else(|| "n/d".into()),
@@ -1121,21 +1280,32 @@ fn gpu_page(
                     Constraint::Min(15),
                     Constraint::Length(7),
                     Constraint::Length(if area.width >= 85 { 23 } else { 16 }),
+                    Constraint::Length(if area.width >= 85 { 12 } else { 0 }),
                     Constraint::Length(8),
                     Constraint::Length(8),
                 ],
             )
             .header(
-                Row::new(["SCHEDA", "CARICO", "VRAM", "TEMP", "POWER"])
+                Row::new(["SCHEDA", "CARICO", "DEDICATA", "CONDIVISA", "TEMP", "POWER"])
                     .style(p.muted())
                     .bottom_margin(1),
             )
             .column_spacing(1)
             .block(panel("Adattatori e telemetria", p)),
-            rows[1],
+            panels[0],
         );
+        if let Some(details) = panels.get(1) {
+            detail_table(
+                frame,
+                *details,
+                "Driver e identità adattatori",
+                &inventory.graphics,
+                state.offset,
+                p,
+            );
+        }
     }
-    frame.render_widget(Paragraph::new("n/d = dato non esposto. La telemetria NVIDIA usa nvidia-smi; altri adattatori possono esporre solo l'identità. La memoria condivisa non equivale alla VRAM dedicata.").style(p.muted()).wrap(Wrap{trim:true}),rows[2]);
+    frame.render_widget(Paragraph::new("n/d = dato non esposto. WDDM/DXGI: carico e memoria Windows quando disponibili; NVIDIA può aggiungere temperatura e potenza. La RAM condivisa è distinta dalla memoria dedicata. Le attribuzioni ai PID non vanno sommate come memoria fisica.").style(p.muted()).wrap(Wrap{trim:true}),rows[2]);
 }
 
 fn io_page(
@@ -1293,7 +1463,11 @@ fn process_page(
         frame,
         rows[0],
         "Processi · dove vanno le risorse",
-        "CPU normalizzata sulla macchina · LLM = riconoscimento euristico del nome.",
+        if state.workspace.loaded.is_some() {
+            "Solo processi LLM archiviati; non è l'elenco completo del sistema operativo."
+        } else {
+            "CPU normalizzata sulla macchina · LLM = riconoscimento euristico del nome."
+        },
         p,
     );
     let sort = match state.sort {
@@ -1353,33 +1527,46 @@ fn process_page(
             Cell::from(bytes(proc.memory_bytes)),
             Cell::from(rate(proc.read_bytes_per_sec)),
             Cell::from(rate(proc.write_bytes_per_sec)),
+            Cell::from(
+                proc.gpu_memory_bytes
+                    .map(bytes)
+                    .unwrap_or_else(|| "n/d".into()),
+            ),
+            Cell::from(optional_percent(proc.gpu_percent)),
+            Cell::from(
+                proc.gpu_shared_memory_bytes
+                    .map(bytes)
+                    .unwrap_or_else(|| "n/d".into()),
+            ),
         ])
     });
-    let widths = if area.width >= 88 {
-        vec![
-            Constraint::Length(7),
-            Constraint::Min(14),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ]
-    } else {
-        vec![
-            Constraint::Length(6),
-            Constraint::Min(10),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Length(0),
-            Constraint::Length(0),
-        ]
-    };
+    let widths = vec![
+        Constraint::Length(6),
+        Constraint::Min(14),
+        Constraint::Length(7),
+        Constraint::Length(11),
+        Constraint::Length(if area.width >= 130 { 11 } else { 0 }),
+        Constraint::Length(if area.width >= 130 { 11 } else { 0 }),
+        Constraint::Length(if area.width >= 88 { 10 } else { 0 }),
+        Constraint::Length(if area.width >= 88 { 7 } else { 0 }),
+        Constraint::Length(if area.width >= 105 { 10 } else { 0 }),
+    ];
     let table = Table::new(body, widths)
         .column_spacing(1)
         .header(
-            Row::new(["PID", "PROCESSO", "CPU", "RAM", "LETTURA", "SCRITTURA"])
-                .style(p.muted())
-                .bottom_margin(1),
+            Row::new([
+                "PID",
+                "PROCESSO",
+                "CPU",
+                "RAM",
+                "LETTURA",
+                "SCRITTURA",
+                "GPU DED",
+                "GPU %",
+                "GPU SH",
+            ])
+            .style(p.muted())
+            .bottom_margin(1),
         )
         .row_highlight_style(Style::default().bg(p.elevated).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌ ")
@@ -1395,6 +1582,8 @@ fn process_page(
 fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiState, p: Palette) {
     let tall = area.height >= 21;
     let tiny = area.height < 14;
+    let history_present =
+        !state.workspace.benchmark_history.is_empty() || !llm.observations.is_empty();
     let rows = split(
         area,
         Direction::Vertical,
@@ -1408,7 +1597,15 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
                 4
             }),
             Constraint::Min(3),
-            Constraint::Length(if tall {
+            Constraint::Length(if history_present {
+                if tiny {
+                    2
+                } else if area.height >= 28 {
+                    12
+                } else {
+                    8
+                }
+            } else if tall {
                 7
             } else if tiny {
                 1
@@ -1421,7 +1618,11 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
         frame,
         rows[0],
         "LLM locali · runtime, modelli e misure",
-        "Endpoint localhost · elenco rilevato, nessun download automatico.",
+        if state.workspace.loaded.is_some() {
+            "Replay: dati API live non archiviati; benchmark salvati disponibili. l torna live."
+        } else {
+            "Endpoint localhost · elenco rilevato, nessun download automatico."
+        },
         p,
     );
     let runtime_rows = llm.runtimes.iter().map(|r| {
@@ -1440,7 +1641,9 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
         ])
     });
     if tiny {
-        let summary = if llm.runtimes.is_empty() {
+        let summary = if state.workspace.loaded.is_some() {
+            "Replay · API live non archiviate · l torna live".into()
+        } else if llm.runtimes.is_empty() {
             "Rilevamento in corso / non disponibile".into()
         } else {
             llm.runtimes
@@ -1469,7 +1672,9 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
             .header(Row::new(["RUNTIME", "STATO", "ENDPOINT", "DETTAGLIO"]).style(p.muted()))
             .column_spacing(1)
             .block(panel(
-                if llm.runtimes.is_empty() {
+                if state.workspace.loaded.is_some() {
+                    "Replay · API dei runtime non archiviate"
+                } else if llm.runtimes.is_empty() {
                     "Runtime · rilevamento in corso / non disponibile"
                 } else {
                     "Runtime locali"
@@ -1545,10 +1750,14 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
                 .add_modifier(Modifier::BOLD),
         )
         .block(panel(
-            format!(
-                "{} modelli · ↑↓ seleziona · b misura inferenza",
-                models.len()
-            ),
+            if state.workspace.loaded.is_some() {
+                "Modelli API non archiviati · risultati storici sotto".into()
+            } else {
+                format!(
+                    "{} modelli · ↑↓ seleziona · b misura inferenza",
+                    models.len()
+                )
+            },
             p,
         ));
     frame.render_stateful_widget(table, rows[2], &mut table_state);
@@ -1599,23 +1808,89 @@ fn llm_page(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &mut UiSta
             )),
         ]
     };
+    let result_width = rows[3].width.saturating_sub(if tiny { 0 } else { 2 }) as usize;
+    let mut results = wrap_diagnostic_lines(benchmark_lines, result_width);
+    append_llm_history(&mut results, llm, state, result_width, p);
+    let visible = rows[3].height.saturating_sub(if tiny { 0 } else { 2 }) as usize;
+    clamp_scroll(state, results.len().saturating_sub(visible));
     if tiny {
         frame.render_widget(
-            Paragraph::new(if state.benchmark_running {
-                "Benchmark in corso…"
-            } else {
-                "b: benchmark locale · max 64 token"
-            })
-            .style(p.muted()),
+            Paragraph::new(results)
+                .scroll((state.offset, 0))
+                .style(p.muted()),
             rows[3],
         );
     } else {
         frame.render_widget(
-            Paragraph::new(benchmark_lines)
-                .wrap(Wrap { trim: true })
-                .block(panel("Ultimo benchmark", p)),
+            Paragraph::new(results)
+                .scroll((state.offset, 0))
+                .block(panel("Risultati e cronologia · PgUp/PgDn scorri", p)),
             rows[3],
         );
+    }
+}
+
+fn append_llm_history(
+    lines: &mut Vec<Line<'static>>,
+    llm: &LlmState,
+    state: &UiState,
+    width: usize,
+    p: Palette,
+) {
+    if !llm.observations.is_empty() {
+        lines.push(Line::default());
+        push_prose(
+            lines,
+            "OSSERVAZIONI DEL SERVER · distinte dai benchmark volontari",
+            p.accent(),
+            width,
+        );
+        for value in llm.observations.iter().rev().take(3) {
+            push_prose(
+                lines,
+                format!(
+                    "{} / {} · {} · TTFT {}",
+                    clean(&value.runtime),
+                    clean(&value.model),
+                    metric_value(value.generation_tokens_per_sec, "token/s", false),
+                    metric_value(value.time_to_first_token_ms, "ms", false)
+                ),
+                p.text(),
+                width,
+            );
+            push_prose(lines, clean(&value.note), p.muted(), width);
+        }
+    }
+    if !state.workspace.benchmark_history.is_empty() {
+        lines.push(Line::default());
+        let mut history = state.workspace.benchmark_history.iter().collect::<Vec<_>>();
+        history.sort_by_key(|entry| std::cmp::Reverse(entry.id));
+        push_prose(
+            lines,
+            format!(
+                "CRONOLOGIA SQLITE · ultime {} prove / osservazioni",
+                history.len().min(100)
+            ),
+            p.accent(),
+            width,
+        );
+        for entry in history.into_iter().take(100) {
+            push_prose(
+                lines,
+                format!(
+                    "#{} · {}",
+                    entry.id,
+                    entry
+                        .session_id
+                        .map(|id| format!("sessione #{id}"))
+                        .unwrap_or_else(|| "senza sessione".into())
+                ),
+                p.accent(),
+                width,
+            );
+            lines.extend(benchmark_lines(Some(entry), width, p));
+            lines.push(Line::default());
+        }
     }
 }
 
@@ -1914,6 +2189,25 @@ fn diagnostics_page(
             Style::default().fg(p.amber),
         )));
     }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "SENSORI DINAMICI · SOLO VALORI ESPOSTI",
+        p.accent(),
+    )));
+    for detail in &snapshot.sensor_details {
+        lines.push(Line::from(format!(
+            "{}: {}",
+            clean(&detail.label),
+            available(&detail.value)
+        )));
+    }
+    for sensor in &snapshot.sensors {
+        lines.push(Line::from(format!(
+            "{}: {:.1} °C",
+            clean(&sensor.name),
+            sensor.temperature
+        )));
+    }
     lines.extend([
         Line::default(),Line::from(Span::styled("COME LEGGERE I DATI",p.accent())),
         Line::from("• CPU processi: percentuale normalizzata sulla capacità totale della macchina."),
@@ -1988,6 +2282,1092 @@ fn wrap_diagnostic_lines(lines: Vec<Line<'_>>, width: usize) -> Vec<Line<'static
     result
 }
 
+fn ellipsize(text: &str, width: usize) -> String {
+    if Line::raw(text).width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let line = Line::raw(text);
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let cells = Span::raw(grapheme.symbol).width();
+        if used + cells > width.saturating_sub(1) {
+            break;
+        }
+        result.push_str(grapheme.symbol);
+        used += cells;
+    }
+    result.push('…');
+    result
+}
+
+fn padded_cell(text: &str, width: usize) -> String {
+    let text = ellipsize(text, width);
+    let pad = width.saturating_sub(Line::raw(&text).width());
+    format!("{text}{}", " ".repeat(pad))
+}
+
+fn duration_label(seconds: f64) -> String {
+    if !seconds.is_finite() {
+        return "n/d".into();
+    }
+    let seconds = seconds.max(0.0) as u64;
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn optional_number(value: Option<f64>, suffix: &str) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{v:.1}{suffix}"))
+        .unwrap_or_else(|| "n/d".into())
+}
+fn optional_bytes(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| bytes(v as u64))
+        .unwrap_or_else(|| "n/d".into())
+}
+fn time_label(timestamp: u64) -> String {
+    chrono::DateTime::from_timestamp(timestamp.min(i64::MAX as u64) as i64, 0)
+        .map(|v| v.format("%H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "n/d".into())
+}
+fn short_date(value: &str) -> String {
+    ellipsize(&clean(value).replace('T', " ").replace('Z', ""), 16)
+}
+
+fn sessions_page(frame: &mut Frame<'_>, area: Rect, state: &mut UiState, p: Palette) {
+    let compact = area.height < 19;
+    let rows = split(
+        area,
+        Direction::Vertical,
+        &[
+            Constraint::Length(if compact { 1 } else { 2 }),
+            Constraint::Length(if compact { 2 } else { 3 }),
+            Constraint::Min(4),
+            Constraint::Length(if compact { 2 } else { 6 }),
+        ],
+    );
+    page_title(
+        frame,
+        rows[0],
+        "Sessioni · il tuo archivio locale",
+        "SQLite persistente · scegli due sessioni come riferimento A e candidata B.",
+        p,
+    );
+    let workspace = &state.workspace;
+    let status = format!(
+        "{} sessioni · A {} · B {} · {}",
+        workspace.sessions.len(),
+        workspace
+            .baseline_id
+            .map(|v| format!("#{v}"))
+            .unwrap_or_else(|| "—".into()),
+        workspace
+            .candidate_id
+            .map(|v| format!("#{v}"))
+            .unwrap_or_else(|| "—".into()),
+        if workspace.loading {
+            "caricamento…"
+        } else if state.recording {
+            "registrazione attiva"
+        } else {
+            "archivio pronto"
+        }
+    );
+    let db = if let Some(error) = &workspace.last_error {
+        format!("! {}", clean(error))
+    } else {
+        format!("DB {}", available(&workspace.db_path))
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                status,
+                if workspace.loading {
+                    Style::default().fg(p.amber)
+                } else {
+                    p.accent()
+                },
+            )),
+            Line::from(Span::styled(
+                db,
+                if workspace.last_error.is_some() {
+                    Style::default().fg(p.red)
+                } else {
+                    p.muted()
+                },
+            )),
+        ]),
+        rows[1],
+    );
+    state.selected = state
+        .selected
+        .min(state.workspace.sessions.len().saturating_sub(1));
+    let table_rows = state.workspace.sessions.iter().map(|session| {
+        let markers = format!(
+            "{}{}{}",
+            if Some(session.id) == state.workspace.baseline_id {
+                "A"
+            } else {
+                " "
+            },
+            if Some(session.id) == state.workspace.candidate_id {
+                "B"
+            } else {
+                " "
+            },
+            if Some(session.id) == state.workspace.active_session {
+                "●"
+            } else {
+                " "
+            }
+        );
+        Row::new(vec![
+            Cell::from(markers).style(p.accent()),
+            Cell::from(format!("#{} {}", session.id, clean(&session.name))),
+            Cell::from(short_date(&session.started_utc)).style(p.muted()),
+            Cell::from(session.samples.to_string()),
+            Cell::from(duration_label(session.duration_secs)),
+            Cell::from(optional_number(session.cpu.average, "%")),
+            Cell::from(optional_number(session.cpu.peak, "%")),
+            Cell::from(optional_bytes(session.ram.peak)),
+            Cell::from(optional_bytes(session.vram.peak)),
+        ])
+    });
+    let widths = if area.width >= 95 {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(16),
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(11),
+            Constraint::Length(11),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(16),
+            Constraint::Length(0),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(0),
+            Constraint::Length(9),
+            Constraint::Length(0),
+        ]
+    };
+    let title = if state.workspace.sessions.is_empty() {
+        "Nessuna sessione · r avvia una registrazione"
+    } else {
+        "Sessioni salvate · Invio apre il replay"
+    };
+    let mut table_state = TableState::default()
+        .with_selected((!state.workspace.sessions.is_empty()).then_some(state.selected));
+    frame.render_stateful_widget(
+        Table::new(table_rows, widths)
+            .column_spacing(1)
+            .header(
+                Row::new([
+                    "A/B",
+                    "SESSIONE",
+                    "INIZIO UTC",
+                    "CAMP.",
+                    "DURATA",
+                    "CPU μ",
+                    "CPU MAX",
+                    "RAM MAX",
+                    "VRAM MAX",
+                ])
+                .style(p.muted()),
+            )
+            .highlight_symbol("▌ ")
+            .row_highlight_style(p.accent().bg(p.elevated))
+            .block(panel(title, p)),
+        rows[2],
+        &mut table_state,
+    );
+    if let Some(session) = state.workspace.sessions.get(state.selected) {
+        let lines = session_summary_lines(session, p);
+        if compact {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!("#{} {}", session.id, clean(&session.name)),
+                        p.accent(),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "CPU max {} · RAM {} · VRAM {}",
+                            optional_number(session.cpu.peak, "%"),
+                            optional_bytes(session.ram.peak),
+                            optional_bytes(session.vram.peak)
+                        ),
+                        p.muted(),
+                    )),
+                ]),
+                rows[3],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: true })
+                    .block(panel("Sessione selezionata · n rinomina · Canc elimina", p)),
+                rows[3],
+            );
+        }
+    } else {
+        frame.render_widget(Paragraph::new("Premi r durante un lavoro per conservare risorse e benchmark. F6 crea un backup del database. I report CSV/JSON restano esportabili.").style(p.muted()).wrap(Wrap{trim:true}),rows[3]);
+    }
+}
+
+fn session_summary_lines(session: &SessionSummary, p: Palette) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!("#{} {}", session.id, clean(&session.name)),
+            p.accent(),
+        )),
+        Line::from(format!(
+            "UTC {} → {} · {} · {} campioni · {} benchmark",
+            clean(&session.started_utc),
+            session
+                .ended_utc
+                .as_deref()
+                .map(clean)
+                .unwrap_or_else(|| "in corso".into()),
+            duration_label(session.duration_secs),
+            session.samples,
+            session.benchmark_count
+        )),
+        Line::from(format!(
+            "CPU media {} / picco {} · RAM media {} / picco {}",
+            optional_number(session.cpu.average, "%"),
+            optional_number(session.cpu.peak, "%"),
+            optional_bytes(session.ram.average),
+            optional_bytes(session.ram.peak)
+        )),
+        Line::from(format!(
+            "VRAM media {} / picco {} · RSS LLM media {} · stato {}",
+            optional_bytes(session.vram.average),
+            optional_bytes(session.vram.peak),
+            optional_bytes(session.llm_ram.average),
+            available(&session.state)
+        )),
+    ]
+}
+
+fn metric_value(value: Option<f64>, unit: &str, signed: bool) -> String {
+    let Some(value) = value.filter(|v| v.is_finite()) else {
+        return "n/d".into();
+    };
+    let sign = if signed {
+        if value < 0.0 { "−" } else { "+" }
+    } else if value < 0.0 {
+        "−"
+    } else {
+        ""
+    };
+    let abs = value.abs();
+    let formatted = match unit {
+        "B" | "bytes" => bytes(abs as u64),
+        "B/s" => rate(abs),
+        "%" => format!("{abs:.1}%"),
+        "s" => format!("{abs:.2}s"),
+        "ms" => format!("{abs:.0}ms"),
+        "mix/s" | "ops/s" => format!("{:.2} M {unit}", abs / 1e6),
+        "token/s" => format!("{abs:.2} tok/s"),
+        _ => format!("{abs:.2} {}", clean(unit)),
+    };
+    format!("{sign}{formatted}")
+}
+
+fn push_prose(lines: &mut Vec<Line<'static>>, text: impl Into<String>, style: Style, width: usize) {
+    lines.extend(wrap_diagnostic_lines(
+        vec![Line::styled(text.into(), style)],
+        width,
+    ));
+}
+
+fn comparison_page(frame: &mut Frame<'_>, area: Rect, state: &mut UiState, p: Palette) {
+    let rows = split(
+        area,
+        Direction::Vertical,
+        &[
+            Constraint::Length(if area.height < 16 { 1 } else { 2 }),
+            Constraint::Min(1),
+        ],
+    );
+    page_title(
+        frame,
+        rows[0],
+        "Confronto · A riferimento → B candidata",
+        "Statistiche su tutti i campioni salvati. Δ = B − A; un delta non dimostra una causa.",
+        p,
+    );
+    let Some(comparison) = &state.workspace.comparison else {
+        let lines = vec![
+            Line::from(Span::styled(
+                "Scegli le sessioni da confrontare",
+                p.accent(),
+            )),
+            Line::default(),
+            Line::from(
+                "F2 apre l'archivio. ↑↓ seleziona una sessione; a la imposta come A, b come B. Premi c per caricare il confronto.",
+            ),
+            Line::default(),
+            Line::from(
+                "Grafici: stessa progressione da 0 a 100% della sessione, con asse verticale in percentuale. Durate e configurazioni diverse richiedono cautela.",
+            ),
+            Line::from(if state.workspace.loading {
+                "Caricamento in corso…"
+            } else {
+                "Nessun confronto caricato."
+            }),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(panel("Un confronto ripetibile", p)),
+            rows[1],
+        );
+        state.offset = 0;
+        return;
+    };
+    let width = rows[1].width.saturating_sub(2) as usize;
+    let mut lines = comparison_lines(comparison, width, p);
+    if let Some(error) = &state.workspace.last_error {
+        push_prose(
+            &mut lines,
+            format!("! {}", clean(error)),
+            Style::default().fg(p.red),
+            width,
+        );
+    }
+    let maximum = lines
+        .len()
+        .saturating_sub(rows[1].height.saturating_sub(2) as usize);
+    state.offset = state.offset.min(maximum.min(u16::MAX as usize) as u16);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((state.offset, 0))
+            .block(panel("Dati, progressione e prove · ↑↓ / PgUp PgDn", p)),
+        rows[1],
+    );
+}
+
+fn comparison_lines(
+    comparison: &SessionComparison,
+    width: usize,
+    p: Palette,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_prose(
+        &mut lines,
+        format!(
+            "A  #{} {}",
+            comparison.left.id,
+            clean(&comparison.left.name)
+        ),
+        p.accent(),
+        width,
+    );
+    push_prose(
+        &mut lines,
+        format!(
+            "B  #{} {}",
+            comparison.right.id,
+            clean(&comparison.right.name)
+        ),
+        Style::default().fg(p.amber).add_modifier(Modifier::BOLD),
+        width,
+    );
+    push_prose(
+        &mut lines,
+        format!(
+            "A: {} · {} campioni  |  B: {} · {} campioni",
+            duration_label(comparison.left.duration_secs),
+            comparison.left.samples,
+            duration_label(comparison.right.duration_secs),
+            comparison.right.samples
+        ),
+        p.muted(),
+        width,
+    );
+    lines.push(Line::default());
+    if width >= 86 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{}{}{}{}{}",
+                padded_cell("METRICA", 26),
+                padded_cell("A", 15),
+                padded_cell("B", 15),
+                padded_cell("Δ B − A", 17),
+                "Δ %"
+            ),
+            p.muted(),
+        )));
+    }
+    append_comparison_metrics(&mut lines, &comparison.metrics, width, p);
+    push_prose(
+        &mut lines,
+        "n/d = dato assente; Δ% non è definito con A = 0. Le percentuali sono variazioni relative, Δ dei carichi è espresso in punti percentuali.",
+        p.muted(),
+        width,
+    );
+    lines.push(Line::default());
+    push_prose(
+        &mut lines,
+        "BENCHMARK · GRUPPI CON METODO COMPATIBILE",
+        p.accent(),
+        width,
+    );
+    if comparison.benchmarks.is_empty() {
+        push_prose(
+            &mut lines,
+            "Nessun gruppo statistico disponibile; le singole prove restano elencate sotto.",
+            p.muted(),
+            width,
+        );
+    }
+    for group in &comparison.benchmarks {
+        push_prose(&mut lines, clean(&group.label), p.accent(), width);
+        push_prose(
+            &mut lines,
+            format!(
+                "{} · metodo {} · A {} prove / B {} prove",
+                clean(&group.kind),
+                available(&group.method),
+                group.runs_left,
+                group.runs_right
+            ),
+            p.muted(),
+            width,
+        );
+        append_comparison_metrics(&mut lines, &group.metrics, width, p);
+        for warning in &group.warnings {
+            push_prose(
+                &mut lines,
+                format!("! {}", clean(warning)),
+                Style::default().fg(p.amber),
+                width,
+            );
+        }
+        lines.push(Line::default());
+    }
+    comparison_progress_and_benchmarks(&mut lines, comparison, width, p);
+    lines
+}
+
+fn append_comparison_metrics(
+    lines: &mut Vec<Line<'static>>,
+    metrics: &[ComparisonMetric],
+    width: usize,
+    p: Palette,
+) {
+    for metric in metrics {
+        let left = metric_value(metric.left, &metric.unit, false);
+        let right = metric_value(metric.right, &metric.unit, false);
+        let delta = metric_value(metric.delta, &metric.unit, true);
+        let delta_percent = metric_value(metric.delta_percent, "%", true);
+        let favorable = metric.delta.filter(|v| v.is_finite()).map(|v| {
+            if metric.lower_is_better {
+                v < 0.0
+            } else {
+                v > 0.0
+            }
+        });
+        let color = if metric.delta == Some(0.0) {
+            p.muted
+        } else {
+            match favorable {
+                Some(true) => p.green,
+                Some(false) => p.amber,
+                None => p.muted,
+            }
+        };
+        if width >= 86 {
+            lines.push(Line::from(vec![
+                Span::styled(padded_cell(&clean(&metric.label), 26), p.text()),
+                Span::raw(padded_cell(&left, 15)),
+                Span::raw(padded_cell(&right, 15)),
+                Span::styled(padded_cell(&delta, 17), Style::default().fg(color)),
+                Span::styled(delta_percent, Style::default().fg(color)),
+            ]));
+        } else {
+            push_prose(
+                lines,
+                clean(&metric.label),
+                p.text().add_modifier(Modifier::BOLD),
+                width,
+            );
+            push_prose(
+                lines,
+                format!("A {left} | B {right} | Δ {delta} ({delta_percent})"),
+                Style::default().fg(color),
+                width,
+            );
+        }
+    }
+}
+
+fn comparison_progress_and_benchmarks(
+    lines: &mut Vec<Line<'static>>,
+    comparison: &SessionComparison,
+    width: usize,
+    p: Palette,
+) {
+    lines.push(Line::default());
+    push_prose(
+        lines,
+        "PROGRESSIONE NORMALIZZATA · asse Y 0–100%",
+        p.accent(),
+        width,
+    );
+    push_prose(
+        lines,
+        "Asse X: avanzamento 0→100% del tempo di ciascuna sessione; le durate possono differire. · indica telemetria assente. L'anteprima può essere sottocampionata.",
+        p.muted(),
+        width,
+    );
+    let points = (width.saturating_sub(9) / 2).clamp(4, 100);
+    for (label, kind, color) in [
+        ("CPU", 0, p.cyan),
+        ("RAM", 1, p.green),
+        ("GPU0", 2, p.amber),
+    ] {
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+        let a = progress_series(&comparison.left_series, points, kind);
+        let b = progress_series(&comparison.right_series, points, kind);
+        lines.push(Line::from(vec![
+            Span::styled("A ", p.muted()),
+            Span::styled(spark_text(&a), Style::default().fg(color)),
+            Span::styled("  B ", p.muted()),
+            Span::styled(spark_text(&b), Style::default().fg(color)),
+        ]));
+    }
+    lines.push(Line::default());
+    push_prose(lines, "CONDIZIONI DEL CONFRONTO", p.accent(), width);
+    if comparison.warnings.is_empty() {
+        push_prose(
+            lines,
+            "Nessun avviso automatico. Verifica comunque stesso modello, quantizzazione, contesto, offload, cache e carico di fondo.",
+            p.muted(),
+            width,
+        );
+    }
+    for warning in &comparison.warnings {
+        push_prose(
+            lines,
+            format!("! {}", clean(warning)),
+            Style::default().fg(p.amber),
+            width,
+        );
+    }
+    lines.push(Line::default());
+    push_prose(
+        lines,
+        "BENCHMARK SALVATI · ogni prova rimane distinta",
+        p.accent(),
+        width,
+    );
+    push_prose(
+        lines,
+        "A e B sono affiancati nell'ordine salvato. Un modello/runtime uguale non prova una configurazione identica. Decode nativo e token/tempo totale non sono intercambiabili; osservazioni di server separate dai test volontari.",
+        p.muted(),
+        width,
+    );
+    let count = comparison
+        .left_benchmarks
+        .len()
+        .max(comparison.right_benchmarks.len());
+    if count == 0 {
+        push_prose(
+            lines,
+            "Nessun benchmark presente nelle due sessioni.",
+            p.muted(),
+            width,
+        );
+    }
+    for index in 0..count {
+        let left = comparison.left_benchmarks.get(index);
+        let right = comparison.right_benchmarks.get(index);
+        push_prose(lines, format!("PROVA {}", index + 1), p.accent(), width);
+        if width >= 86 {
+            let col = (width.saturating_sub(3)) / 2;
+            let a = benchmark_lines(left, col, p);
+            let b = benchmark_lines(right, col, p);
+            for row in 0..a.len().max(b.len()) {
+                let a = a.get(row).map(ToString::to_string).unwrap_or_default();
+                let b = b.get(row).map(ToString::to_string).unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::raw(padded_cell(&a, col)),
+                    Span::styled(" │ ", p.muted()),
+                    Span::raw(b),
+                ]));
+            }
+        } else {
+            push_prose(lines, "A", p.accent(), width);
+            lines.extend(benchmark_lines(left, width, p));
+            push_prose(lines, "B", Style::default().fg(p.amber), width);
+            lines.extend(benchmark_lines(right, width, p));
+        }
+        if let (Some(a), Some(b)) = (left, right) {
+            push_prose(lines, benchmark_delta(a, b), p.muted(), width);
+        }
+        lines.push(Line::default());
+    }
+}
+
+fn progress_series(samples: &[Snapshot], points: usize, kind: u8) -> Vec<Option<f64>> {
+    if samples.is_empty() {
+        return vec![None; points];
+    }
+    let first = samples.first().map(|s| s.elapsed_secs).unwrap_or(0.0);
+    let last = samples.last().map(|s| s.elapsed_secs).unwrap_or(first);
+    let elapsed = last - first;
+    let coordinates = samples
+        .iter()
+        .enumerate()
+        .map(|(index, s)| {
+            if elapsed.is_finite() && elapsed > 0.0 {
+                ((s.elapsed_secs - first) / elapsed).clamp(0.0, 1.0)
+            } else if samples.len() > 1 {
+                index as f64 / (samples.len() - 1) as f64
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let value = |sample: &Snapshot| {
+        match kind {
+            0 => Some(sample.cpu_percent as f64),
+            1 => {
+                (sample.memory_total > 0).then(|| percent(sample.memory_used, sample.memory_total))
+            }
+            _ => sample
+                .gpus
+                .first()
+                .and_then(|g| g.utilization)
+                .map(f64::from),
+        }
+        .filter(|v| v.is_finite())
+        .map(safe_percent)
+    };
+    let mut result = Vec::with_capacity(points);
+    let mut right = 0;
+    for point in 0..points {
+        let target = point as f64 / points.saturating_sub(1).max(1) as f64;
+        while right + 1 < samples.len() && coordinates[right] < target {
+            right += 1;
+        }
+        if right == 0 {
+            result.push(value(&samples[0]));
+            continue;
+        }
+        let left = right - 1;
+        let span = coordinates[right] - coordinates[left];
+        result.push(match (value(&samples[left]), value(&samples[right])) {
+            (Some(a), Some(b)) if span > 0.0 => {
+                Some(a + (b - a) * ((target - coordinates[left]) / span).clamp(0.0, 1.0))
+            }
+            (_, b) if target >= coordinates[right] => b,
+            (a, _) if target <= coordinates[left] => a,
+            _ => None,
+        });
+    }
+    result
+}
+
+fn spark_text(values: &[Option<f64>]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    values
+        .iter()
+        .map(|value| {
+            value
+                .map(|v| BARS[((safe_percent(v) / 100.0) * 7.0).round() as usize])
+                .unwrap_or('·')
+        })
+        .collect()
+}
+
+fn benchmark_lines(value: Option<&SavedBenchmark>, width: usize, p: Palette) -> Vec<Line<'static>> {
+    let Some(value) = value else {
+        return vec![Line::from(Span::styled("Nessuna prova", p.muted()))];
+    };
+    let mut lines = Vec::new();
+    push_prose(
+        &mut lines,
+        format!("{} · {}", clean(&value.kind), clean(&value.recorded_utc)),
+        p.muted(),
+        width,
+    );
+    if let Some(cpu) = &value.cpu {
+        push_prose(
+            &mut lines,
+            format!(
+                "CPU {} · {} worker · build {}",
+                clean(&cpu.algorithm),
+                cpu.threads,
+                available(&cpu.build_profile)
+            ),
+            p.text(),
+            width,
+        );
+        push_prose(
+            &mut lines,
+            format!(
+                "Single {} · Multi {}",
+                metric_value(Some(cpu.single_ops_per_sec), "mix/s", false),
+                metric_value(Some(cpu.multi_ops_per_sec), "mix/s", false)
+            ),
+            p.text(),
+            width,
+        );
+        push_prose(
+            &mut lines,
+            format!(
+                "Durata {}",
+                metric_value(Some(cpu.duration_secs), "s", false)
+            ),
+            p.muted(),
+            width,
+        );
+    }
+    if let Some(llm) = &value.llm {
+        push_prose(
+            &mut lines,
+            format!("{} / {}", clean(&llm.runtime), clean(&llm.model)),
+            p.text(),
+            width,
+        );
+        push_prose(
+            &mut lines,
+            format!(
+                "{} token · {} · TTFT {}",
+                llm.output_tokens
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "n/d".into()),
+                metric_value(llm.generation_tokens_per_sec, "token/s", false),
+                metric_value(llm.time_to_first_token_ms, "ms", false)
+            ),
+            p.text(),
+            width,
+        );
+        push_prose(
+            &mut lines,
+            format!(
+                "Durata {} · metodo {}",
+                metric_value(Some(llm.wall_seconds), "s", false),
+                available(&llm.throughput_kind),
+            ),
+            p.muted(),
+            width,
+        );
+        push_prose(
+            &mut lines,
+            format!("Nota: {}", available(&llm.note)),
+            p.muted(),
+            width,
+        );
+    }
+    lines
+}
+
+fn benchmark_delta(left: &SavedBenchmark, right: &SavedBenchmark) -> String {
+    if left.kind != right.kind {
+        return "Δ non calcolato: tipi di prova diversi.".into();
+    }
+    if let (Some(a), Some(b)) = (&left.cpu, &right.cpu)
+        && a.algorithm == b.algorithm
+        && a.threads == b.threads
+        && !a.build_profile.is_empty()
+        && a.build_profile == b.build_profile
+    {
+        return format!(
+            "Stesso kernel/worker · Δ single {} · Δ multi {}. Verificare hardware e build.",
+            metric_value(
+                Some(b.single_ops_per_sec - a.single_ops_per_sec),
+                "mix/s",
+                true
+            ),
+            metric_value(
+                Some(b.multi_ops_per_sec - a.multi_ops_per_sec),
+                "mix/s",
+                true
+            )
+        );
+    }
+    if let (Some(a), Some(b)) = (&left.llm, &right.llm)
+        && a.runtime == b.runtime
+        && a.model == b.model
+        && a.note == b.note
+        && !a.throughput_kind.is_empty()
+        && a.throughput_kind == b.throughput_kind
+        && a.throughput_kind != "unavailable"
+    {
+        return format!(
+            "Stesso modello/runtime/metodo dichiarato · Δ throughput {} · Δ TTFT {}. Configurazione da verificare.",
+            metric_value(
+                a.generation_tokens_per_sec
+                    .zip(b.generation_tokens_per_sec)
+                    .map(|(a, b)| b - a),
+                "token/s",
+                true
+            ),
+            metric_value(
+                a.time_to_first_token_ms
+                    .zip(b.time_to_first_token_ms)
+                    .map(|(a, b)| b - a),
+                "ms",
+                true
+            )
+        );
+    }
+    "Δ non calcolato: kernel, modello, runtime o metodo differenti/non verificabili.".into()
+}
+
+fn settings_page(frame: &mut Frame<'_>, area: Rect, state: &mut UiState, p: Palette) {
+    let compact = area.height < 20;
+    let rows = split(
+        area,
+        Direction::Vertical,
+        &[
+            Constraint::Length(if compact { 1 } else { 2 }),
+            Constraint::Length(if compact { 5 } else { 12 }),
+            Constraint::Min(2),
+        ],
+    );
+    page_title(
+        frame,
+        rows[0],
+        "Impostazioni · una postazione che ricorda",
+        "Preferenze salvate automaticamente in SQLite · nessuna credenziale richiesta.",
+        p,
+    );
+    let prefs = &state.workspace.preferences;
+    let alerts = &prefs.alerts;
+    let values = [
+        if state.theme_light {
+            "Chiaro".into()
+        } else {
+            "Scuro".into()
+        },
+        format!("{} ms", state.tick_ms),
+        if alerts.enabled {
+            "Sì".into()
+        } else {
+            "No".into()
+        },
+        format!("{:.0}%", alerts.cpu_percent),
+        format!("{:.0}%", alerts.ram_percent),
+        format!("{:.0}%", alerts.vram_percent),
+        format!("{:.0} °C", alerts.gpu_temperature_c),
+        format!("{:.0} °C", alerts.cpu_temperature_c),
+        prefs.benchmark_repeats.to_string(),
+    ];
+    state.workspace.settings_field = state
+        .workspace
+        .settings_field
+        .min(SETTINGS_FIELDS.len().saturating_sub(1));
+    let table_rows = SETTINGS_FIELDS
+        .iter()
+        .zip(values)
+        .map(|(label, value)| Row::new([(*label).to_string(), value]));
+    let mut selected = TableState::default().with_selected(Some(state.workspace.settings_field));
+    frame.render_stateful_widget(
+        Table::new(
+            table_rows,
+            [Constraint::Percentage(67), Constraint::Percentage(33)],
+        )
+        .header(Row::new(["PREFERENZA", "VALORE"]).style(p.muted()))
+        .highlight_symbol("▌ ")
+        .row_highlight_style(p.accent().bg(p.elevated))
+        .block(panel("↑↓ scegli · + − modifica", p)),
+        rows[1],
+        &mut selected,
+    );
+    let inner = rows[2].width.saturating_sub(2) as usize;
+    let mut lines = Vec::new();
+    push_prose(
+        &mut lines,
+        format!("DB {}", available(&state.workspace.db_path)),
+        p.muted(),
+        inner,
+    );
+    if let Some(error) = &state.workspace.last_error {
+        push_prose(
+            &mut lines,
+            format!("! Salvataggio/database: {}", clean(error)),
+            Style::default().fg(p.red),
+            inner,
+        );
+    }
+    push_prose(
+        &mut lines,
+        format!(
+            "Salvataggio automatico · cooldown avvisi {}s · F6 backup SQLite",
+            alerts.cooldown_seconds
+        ),
+        p.muted(),
+        inner,
+    );
+    push_prose(
+        &mut lines,
+        "Tema, intervallo, ordinamento e Capacity Lab vengono ricordati. Gli avvisi usano solo sensori disponibili; non sono notifiche del sistema operativo.",
+        p.muted(),
+        inner,
+    );
+    push_prose(
+        &mut lines,
+        format!(
+            "AVVISI · {} eventi · {}",
+            state.workspace.alerts.len(),
+            if alerts.enabled {
+                "attivi"
+            } else {
+                "sospesi; eventi precedenti conservati"
+            }
+        ),
+        p.accent(),
+        inner,
+    );
+    if state.workspace.alerts.is_empty() {
+        push_prose(
+            &mut lines,
+            "Nessun superamento registrato. Dato assente non equivale a valore sotto soglia.",
+            p.muted(),
+            inner,
+        );
+    }
+    for alert in state.workspace.alerts.iter().rev() {
+        push_prose(
+            &mut lines,
+            format!(
+                "{}  {}",
+                time_label(alert.timestamp_unix),
+                clean(&alert.message)
+            ),
+            Style::default().fg(p.amber),
+            inner,
+        );
+    }
+    let max = lines
+        .len()
+        .saturating_sub(rows[2].height.saturating_sub(2) as usize);
+    state.offset = state.offset.min(max.min(u16::MAX as usize) as u16);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((state.offset, 0))
+            .block(panel("Archivio, salvataggio e avvisi · PgUp/PgDn", p)),
+        rows[2],
+    );
+}
+
+fn session_name_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
+    let target = modal_area(area, 78, 12);
+    frame.render_widget(Clear, target);
+    let block = panel("Rinomina sessione", p);
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let panes = split(
+        inner,
+        Direction::Vertical,
+        &[
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ],
+    );
+    let value = state.workspace.name_edit.as_deref().unwrap_or("");
+    let width = target.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new("Un nome per riconoscere il lavoro svolto").style(p.accent()),
+        panes[0],
+    );
+    let mut name = wrap_diagnostic_lines(
+        vec![Line::styled(
+            format!("{}▏", clean(value)),
+            p.text().bg(p.elevated),
+        )],
+        width,
+    );
+    let visible = panes[1].height.max(1) as usize;
+    if name.len() > visible {
+        name.drain(..name.len() - visible);
+    }
+    frame.render_widget(Paragraph::new(name), panes[1]);
+    frame.render_widget(
+        Paragraph::new("Invio salva il nome · Esc annulla\nIl nome viene conservato in SQLite.")
+            .style(Style::default().fg(p.amber)),
+        panes[2],
+    );
+}
+
+fn session_delete_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
+    let target = modal_area(area, 78, 13);
+    frame.render_widget(Clear, target);
+    let block = panel("Conferma eliminazione", p);
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let panes = split(
+        inner,
+        Direction::Vertical,
+        &[Constraint::Min(1), Constraint::Length(2)],
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Eliminare questa sessione dall'archivio?",
+            Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
+    if let Some(session) = state.workspace.sessions.get(state.selected) {
+        push_prose(
+            &mut lines,
+            format!("#{} {}", session.id, clean(&session.name)),
+            p.accent(),
+            target.width.saturating_sub(2) as usize,
+        );
+        push_prose(
+            &mut lines,
+            format!(
+                "{} campioni · {} benchmark · {}",
+                session.samples,
+                session.benchmark_count,
+                duration_label(session.duration_secs)
+            ),
+            p.text(),
+            target.width.saturating_sub(2) as usize,
+        );
+    }
+    lines.extend([
+        Line::default(),
+        Line::from("L'eliminazione rimuove i dati salvati della sessione."),
+        Line::from("Un backup del database permette di conservarne una copia."),
+    ]);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), panes[0]);
+    frame.render_widget(
+        Paragraph::new("Invio elimina · Esc annulla\nL'operazione rimuove i dati dal database.")
+            .style(Style::default().fg(p.amber)),
+        panes[1],
+    );
+}
+
 fn modal_area(area: Rect, width: u16, height: u16) -> Rect {
     let width = width
         .min(area.width.saturating_sub(2))
@@ -2006,19 +3386,22 @@ fn modal_area(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn help_modal(frame: &mut Frame<'_>, area: Rect, p: Palette) {
-    let target = modal_area(area, 88, 28);
+    let target = modal_area(area, 88, 30);
     frame.render_widget(Clear, target);
     if target.height < 24 {
         let lines = vec![
             Line::from(Span::styled("COMANDI · Esc / ? chiude", p.accent())),
-            Line::from("Tab / Shift-Tab · ← → · 1…9,0: pagine"),
+            Line::from("Tab / Shift-Tab · ← →: 13 pagine · 1…9,0 hardware"),
+            Line::from("F2 Sessioni · F3 Confronto · F4 Impostazioni"),
             Line::from("↑↓ / PgUp PgDn / Home End: scorri, seleziona"),
             Line::from("Processi: / cerca · s ordina · a verso · Invio dettagli"),
             Line::from("Spazio pausa · + − intervallo · t tema"),
-            Line::from("e esporta · r registra · q esci"),
-            Line::from("CPU: x poi Invio benchmark (~1,2s di carico)"),
-            Line::from("LLM: ↑↓ modello · b poi Invio (max 64 token)"),
-            Line::from("Capacity: [ ] campo · + − valore"),
+            Line::from("e esporta · r registra · F6 backup · q esci"),
+            Line::from("CPU: x / Shift+X poi Invio · c annulla"),
+            Line::from("LLM: b / Shift+B misura · c annulla · F5 aggiorna"),
+            Line::from("Sessioni: Invio replay · a A · b B · c confronta"),
+            Line::from("n rinomina · Canc elimina · [ ] campione · l live"),
+            Line::from("Capacity: [ ] campo · + − valore; Opzioni: ↑↓ + −"),
             Line::from(Span::styled(
                 "RAM e VRAM: vincoli separati · n/d: dato assente",
                 p.muted(),
@@ -2039,7 +3422,8 @@ fn help_modal(frame: &mut Frame<'_>, area: Rect, p: Palette) {
         )),
         Line::default(),
         Line::from("Tab / Shift-Tab   Pagina successiva / precedente"),
-        Line::from("← →  oppure 1…9,0 Seleziona le 10 pagine"),
+        Line::from("← → tutte le 13 pagine; 1…9,0 seleziona le viste hardware"),
+        Line::from("F2 Sessioni · F3 Confronto · F4 Impostazioni · F6 backup SQLite"),
         Line::from("↑ ↓ · PgUp PgDn   Scorri dettagli / seleziona un processo o modello"),
         Line::from("Home / End        Primo / ultimo elemento"),
         Line::from("/                 Cerca processi per nome o PID; Invio applica"),
@@ -2047,14 +3431,18 @@ fn help_modal(frame: &mut Frame<'_>, area: Rect, p: Palette) {
         Line::from("Invio             Dettagli del processo selezionato"),
         Line::from("Spazio            Congela / riprende la vista hardware"),
         Line::from("+ / −             Aumenta / riduce l'intervallo dei campioni"),
-        Line::from("e / r             Esporta report / avvia o ferma registrazione CSV"),
+        Line::from("e / r             Esporta report / avvia o ferma registrazione locale"),
         Line::from("t                 Tema scuro / chiaro"),
         Line::default(),
         Line::from(Span::styled("LLM LOCALI E CAPACITY LAB", p.accent())),
         Line::from("LLM: ↑↓ modello, b poi Invio per inferenza locale (max 64 token)."),
-        Line::from("CPU: x poi Invio per carico hash mixing single / multi thread (~1,2s)."),
+        Line::from("Shift+B ripete il benchmark; c annulla; F5 aggiorna i runtime."),
+        Line::from("CPU: x / Shift+X poi Invio per prova singola / ripetuta (~1,2s per prova)."),
         Line::from("Capacity: [ ] campo; + − modifica il parametro selezionato."),
         Line::from("La stima tratta RAM e VRAM separatamente. Non è un benchmark."),
+        Line::from("Sessioni: Invio replay, a riferimento A, b candidata B, c confronto."),
+        Line::from("n rinomina, Canc elimina con conferma; [ ] campione, l torna live."),
+        Line::from("Impostazioni: ↑↓ sceglie un campo, + − cambia; salvataggio automatico."),
         Line::default(),
         Line::from(Span::styled(
             "Esc / ? chiude la guida · q esce dall'applicazione",
@@ -2079,7 +3467,11 @@ fn benchmark_modal(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &Ui
     frame.render_widget(Clear, target);
     let mut lines = vec![
         Line::from(Span::styled(
-            "Eseguire una breve inferenza locale?",
+            if state.workspace.repeat_requested {
+                "Eseguire la serie di inferenze locali?"
+            } else {
+                "Eseguire una breve inferenza locale?"
+            },
             p.accent(),
         )),
         Line::default(),
@@ -2092,6 +3484,14 @@ fn benchmark_modal(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &Ui
                 clean(&runtime.endpoint)
             )),
             Line::from(format!("Modello: {}", clean(&model.id))),
+            Line::from(format!(
+                "{} prova/e · massimo 64 token per prova",
+                if state.workspace.repeat_requested {
+                    state.workspace.preferences.benchmark_repeats
+                } else {
+                    1
+                }
+            )),
             Line::default(),
             Line::from("Invia un prompt di prova e richiede al massimo 64 token di output."),
             Line::from("Il runtime può caricare il modello e usare CPU, RAM e GPU."),
@@ -2119,16 +3519,24 @@ fn benchmark_modal(frame: &mut Frame<'_>, area: Rect, llm: &LlmState, state: &Ui
     );
 }
 
-fn cpu_benchmark_modal(frame: &mut Frame<'_>, area: Rect, p: Palette) {
-    let target = modal_area(area, 76, 16);
+fn cpu_benchmark_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
+    let target = modal_area(area, 80, 19);
     frame.render_widget(Clear, target);
+    let runs = if state.workspace.repeat_requested {
+        state.workspace.preferences.benchmark_repeats
+    } else {
+        1
+    };
     let lines = vec![
         Line::from(Span::styled(
             "Misurare la capacità di calcolo della CPU?",
             p.accent(),
         )),
         Line::default(),
-        Line::from("Esegue circa 1,2 secondi di hash mixing nativo: una fase single"),
+        Line::from(format!(
+            "{runs} prova/e · circa {:.1}s di hash mixing: una fase single",
+            runs as f64 * 1.2
+        )),
         Line::from("thread e una fase multi thread. Aumenta temporaneamente il carico"),
         Line::from("e il consumo del processore; le altre attività possono rallentare."),
         Line::default(),
@@ -2150,7 +3558,7 @@ fn cpu_benchmark_modal(frame: &mut Frame<'_>, area: Rect, p: Palette) {
 }
 
 fn process_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette) {
-    let target = modal_area(area, 76, 16);
+    let target = modal_area(area, 80, 19);
     frame.render_widget(Clear, target);
     let lines = if let Some(proc) = &state.process_detail_row {
         vec![
@@ -2160,6 +3568,22 @@ fn process_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette)
             Line::from(format!("PID             {}", proc.pid)),
             Line::from(format!("CPU macchina    {:.2}%", proc.cpu_percent)),
             Line::from(format!("RAM residente   {}", bytes(proc.memory_bytes))),
+            Line::from(format!(
+                "GPU dedicata    {}",
+                proc.gpu_memory_bytes
+                    .map(bytes)
+                    .unwrap_or_else(|| "n/d".into())
+            )),
+            Line::from(format!(
+                "GPU condivisa   {}",
+                proc.gpu_shared_memory_bytes
+                    .map(bytes)
+                    .unwrap_or_else(|| "n/d".into())
+            )),
+            Line::from(format!(
+                "GPU max motore  {}",
+                optional_percent(proc.gpu_percent)
+            )),
             Line::from(format!("Lettura         {}", rate(proc.read_bytes_per_sec))),
             Line::from(format!(
                 "Scrittura       {}",
@@ -2175,7 +3599,7 @@ fn process_modal(frame: &mut Frame<'_>, area: Rect, state: &UiState, p: Palette)
             )),
             Line::default(),
             Line::from(Span::styled(
-                "Valori fissati all'apertura del dettaglio. Esc per chiudere.",
+                "Istantanea. Attribuzioni GPU per PID; non sommare i PID come memoria fisica. Esc chiude.",
                 p.muted(),
             )),
         ]
@@ -2308,7 +3732,7 @@ mod tests {
             (100, 32),
             (160, 48),
         ] {
-            for tab in 0..10 {
+            for tab in 0..TABS.len() {
                 let mut state = UiState {
                     active_tab: tab,
                     selected: usize::MAX,
@@ -2395,6 +3819,8 @@ mod tests {
         assert_eq!(sidebar_tab_at(80, 24, 10, 6), None);
         assert_eq!(sidebar_tab_at(120, 40, 50, 6), None);
         assert_eq!(sidebar_tab_at(100, 24, 10, 15), Some(9));
+        assert_eq!(sidebar_tab_at(100, 24, 10, 18), Some(12));
+        assert_eq!(sidebar_tab_at(120, 40, 10, 30), Some(12));
     }
 
     #[test]
@@ -2609,5 +4035,356 @@ mod tests {
         assert!(text.contains("日本語"));
         assert!(text.contains("🦀"));
         assert!(text.contains("lunghissimap"));
+    }
+
+    fn workspace_fixture() -> UiState {
+        use crate::storage::{ComparisonMetric, MetricSummary, SessionData};
+        let mut state = UiState::default();
+        state.workspace.db_path = "C:\\Dati\\RUST-CPU\\workspace.sqlite3".into();
+        state.workspace.sessions = (1..=60)
+            .map(|id| SessionSummary {
+                id,
+                name: format!("Sessione {id:02} · analisi locale"),
+                started_utc: "2026-10-19T10:30:00Z".into(),
+                ended_utc: Some("2026-10-19T10:40:00Z".into()),
+                state: "complete".into(),
+                samples: 600,
+                duration_secs: 600.0,
+                cpu: MetricSummary {
+                    average: Some(42.0),
+                    peak: Some(95.0),
+                    p95: Some(90.0),
+                },
+                ram: MetricSummary {
+                    average: Some((8u64 << 30) as f64),
+                    peak: Some((12u64 << 30) as f64),
+                    ..Default::default()
+                },
+                vram: MetricSummary {
+                    peak: Some((4u64 << 30) as f64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+        state.workspace.baseline_id = Some(1);
+        state.workspace.candidate_id = Some(2);
+        state.workspace.active_session = Some(3);
+        let samples = vec![
+            Snapshot {
+                elapsed_secs: 0.0,
+                cpu_percent: 0.0,
+                memory_used: 2 << 30,
+                memory_total: 8 << 30,
+                ..Default::default()
+            },
+            Snapshot {
+                elapsed_secs: 10.0,
+                cpu_percent: 100.0,
+                memory_used: 4 << 30,
+                memory_total: 8 << 30,
+                ..Default::default()
+            },
+        ];
+        state.workspace.comparison = Some(SessionComparison {
+            left: state.workspace.sessions[0].clone(),
+            right: state.workspace.sessions[1].clone(),
+            metrics: vec![
+                ComparisonMetric {
+                    label: "CPU media".into(),
+                    unit: "%".into(),
+                    left: Some(0.0),
+                    right: Some(12.0),
+                    delta: Some(12.0),
+                    delta_percent: None,
+                    lower_is_better: true,
+                },
+                ComparisonMetric {
+                    label: "RAM picco".into(),
+                    unit: "B".into(),
+                    left: Some((8u64 << 30) as f64),
+                    right: Some((6u64 << 30) as f64),
+                    delta: Some(-((2u64 << 30) as f64)),
+                    delta_percent: Some(-25.0),
+                    lower_is_better: true,
+                },
+                ComparisonMetric {
+                    label: "GPU mancante".into(),
+                    unit: "%".into(),
+                    ..Default::default()
+                },
+            ],
+            warnings: vec!["Durate o contesti diversi: verificare prima di confrontare.".into()],
+            left_series: samples.clone(),
+            right_series: samples.clone(),
+            left_benchmarks: vec![SavedBenchmark {
+                kind: "llm".into(),
+                recorded_utc: "2026-10-19T10:35:00Z".into(),
+                llm: Some(BenchmarkResult {
+                    runtime: "Ollama".into(),
+                    model: "test:8b".into(),
+                    note: "decode nativo".into(),
+                    generation_tokens_per_sec: Some(30.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            right_benchmarks: vec![SavedBenchmark {
+                kind: "llm".into(),
+                recorded_utc: "2026-10-19T10:35:00Z".into(),
+                llm: Some(BenchmarkResult {
+                    runtime: "Ollama".into(),
+                    model: "test:8b".into(),
+                    note: "tempo totale end-to-end".into(),
+                    generation_tokens_per_sec: Some(20.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            benchmarks: vec![crate::storage::BenchmarkComparison {
+                label: "Ollama test:8b".into(),
+                kind: "llm".into(),
+                method: "native_decode".into(),
+                runs_left: 3,
+                runs_right: 3,
+                metrics: vec![ComparisonMetric {
+                    label: "Throughput mediana".into(),
+                    unit: "token/s".into(),
+                    left: Some(30.0),
+                    right: Some(33.0),
+                    delta: Some(3.0),
+                    delta_percent: Some(10.0),
+                    ..Default::default()
+                }],
+                warnings: vec!["Verificare contesto e cache.".into()],
+            }],
+        });
+        state.workspace.loaded = Some(SessionData {
+            summary: state.workspace.sessions[0].clone(),
+            samples,
+            total_samples: 600,
+            ..Default::default()
+        });
+        state.workspace.replay_index = 1;
+        state.workspace.alerts = vec![crate::settings::AlertEvent {
+            timestamp_unix: 1792405800,
+            kind: "ram".into(),
+            message: "RAM oltre soglia: 95%".into(),
+            value: 95.0,
+            threshold: 90.0,
+        }];
+        state
+    }
+
+    #[test]
+    fn workspace_pages_handle_empty_many_sessions_and_compact_navigation() {
+        let (inv, snapshot, llm, history) = fixture();
+        for (width, height) in [(40, 12), (64, 18), (100, 24), (140, 45)] {
+            for tab in 10..TABS.len() {
+                let mut state = workspace_fixture();
+                state.active_tab = tab;
+                state.selected = usize::MAX;
+                state.offset = u16::MAX;
+                state.workspace.settings_field = 8;
+                let text = draw(width, height, &inv, &snapshot, &llm, &mut state, &history);
+                assert!(
+                    text.contains(if tab == 10 {
+                        "Sessioni"
+                    } else if tab == 11 {
+                        "Confronto"
+                    } else {
+                        "Impostazioni"
+                    }),
+                    "active workspace tab must remain discoverable"
+                );
+                draw(
+                    width,
+                    height,
+                    &Inventory::default(),
+                    &Snapshot::default(),
+                    &LlmState::default(),
+                    &mut UiState {
+                        active_tab: tab,
+                        ..Default::default()
+                    },
+                    &History::default(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_session_markers_and_settings_show_real_state() {
+        let (inv, snapshot, llm, history) = fixture();
+        let mut state = workspace_fixture();
+        state.active_tab = 10;
+        let text = draw(140, 45, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(text.contains("REPLAY"));
+        assert!(text.contains("campione 2/2"));
+        assert!(text.contains("600 totali"));
+        assert!(text.contains("A #1"));
+        assert!(text.contains("B #2"));
+        assert!(text.contains("Sessione 01"));
+        state.active_tab = 12;
+        state.workspace.settings_field = 8;
+        let text = draw(120, 38, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(text.contains("Ripetizioni benchmark"));
+        assert!(text.contains("workspace.sqlite3"));
+        assert!(text.contains("RAM oltre soglia"));
+    }
+
+    #[test]
+    fn comparison_preserves_unknown_zero_baseline_and_benchmark_method_caveats() {
+        let state = workspace_fixture();
+        let comparison = state.workspace.comparison.as_ref().unwrap();
+        let lines = comparison_lines(comparison, 100, Palette::new(false));
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("+12.0%"));
+        assert!(text.contains("−2.0 GiB"));
+        assert!(text.contains("−25.0%"));
+        assert!(text.contains("n/d"));
+        assert!(text.contains("A = 0"));
+        assert!(text.contains("Δ non calcolato"));
+        assert!(text.contains("decode nativo"));
+        assert!(text.contains("end-to-end"));
+        assert!(!text.contains("inf%"));
+        assert!(lines.iter().all(|line| line.width() <= 100));
+        let samples = &comparison.left_series;
+        assert_eq!(
+            progress_series(samples, 5, 0),
+            vec![Some(0.0), Some(25.0), Some(50.0), Some(75.0), Some(100.0)]
+        );
+        assert_eq!(spark_text(&progress_series(samples, 5, 2)), "·····");
+        assert_eq!(metric_value(Some(-0.0), "B", true), "+0 B");
+    }
+
+    #[test]
+    fn workspace_modals_keep_actions_visible_for_long_unicode_names() {
+        let (inv, snapshot, llm, history) = fixture();
+        for (width, height) in [(64, 18), (100, 24), (140, 45)] {
+            let mut state = workspace_fixture();
+            state.active_tab = 10;
+            state.workspace.sessions[0].name = "Sessione 日本語 🦀 con nome lungo ".repeat(20);
+            state.workspace.name_edit = Some(state.workspace.sessions[0].name.clone());
+            let text = draw(width, height, &inv, &snapshot, &llm, &mut state, &history);
+            assert!(text.contains("Invio salva il nome"));
+            assert!(text.contains("Esc annulla"));
+            state.workspace.name_edit = None;
+            state.workspace.delete_confirm = true;
+            let text = draw(width, height, &inv, &snapshot, &llm, &mut state, &history);
+            assert!(text.contains("Invio elimina"));
+            assert!(text.contains("Esc annulla"));
+        }
+    }
+
+    #[test]
+    fn comparison_end_then_up_persists_physical_offset() {
+        let (inv, snapshot, llm, history) = fixture();
+        let mut state = workspace_fixture();
+        state.active_tab = 11;
+        state.offset = u16::MAX;
+        let end = draw(64, 18, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(state.offset > 0 && state.offset < u16::MAX);
+        let offset = state.offset;
+        state.offset -= 1;
+        let up = draw(64, 18, &inv, &snapshot, &llm, &mut state, &history);
+        assert_eq!(state.offset, offset - 1);
+        assert_ne!(end, up);
+    }
+
+    #[test]
+    fn global_history_includes_standalone_observations_and_bounds_latest_entries() {
+        let (inv, snapshot, llm, history) = fixture();
+        let mut state = workspace_fixture();
+        state.active_tab = 7;
+        state.workspace.loaded = None;
+        state.workspace.benchmark_history=(1..=105).map(|id|SavedBenchmark{id,session_id:None,kind:"observed".into(),recorded_utc:"2026-10-19T10:30:00Z".into(),llm:Some(BenchmarkResult{runtime:"Proxy locale".into(),model:format!("orphan-model-{id:03}"),throughput_kind:"end_to_end".into(),note:"Osservazione di una richiesta transitata dal proxy; non misura tutte le applicazioni.".into(),..Default::default()}),..Default::default()}).collect();
+        let mut lines = Vec::new();
+        append_llm_history(&mut lines, &llm, &state, 70, Palette::new(false));
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("ultime 100"));
+        assert!(text.contains("senza sessione"));
+        assert!(text.contains("observed"));
+        assert!(text.contains("orphan-model-105"));
+        assert!(text.contains("orphan-model-006"));
+        assert!(!text.contains("orphan-model-005"));
+        assert!(lines.iter().all(|line| line.width() <= 70));
+        state.offset = u16::MAX;
+        let end = draw(64, 18, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(state.offset > 0 && state.offset < u16::MAX);
+        let offset = state.offset;
+        state.offset -= 1;
+        let up = draw(64, 18, &inv, &snapshot, &llm, &mut state, &history);
+        assert_eq!(state.offset, offset - 1);
+        assert_ne!(end, up);
+    }
+
+    #[test]
+    fn archive_comparison_and_configuration_headers_do_not_claim_live_samples() {
+        let (inv, snapshot, llm, history) = fixture();
+        for (tab, label) in [(10, "ARCHIVIO"), (11, "CONFRONTO"), (12, "CONFIG")] {
+            let mut state = UiState {
+                active_tab: tab,
+                ..Default::default()
+            };
+            let text = draw(120, 38, &inv, &snapshot, &llm, &mut state, &history);
+            let header = text.lines().next().unwrap();
+            assert!(header.contains(label));
+            assert!(!header.contains("LIVE"));
+            assert!(!header.contains("CPU 42.5%"));
+        }
+    }
+
+    #[test]
+    fn repeated_benchmark_confirmation_shows_count_and_cpu_load_duration() {
+        let (inv, snapshot, llm, history) = fixture();
+        let mut state = UiState {
+            active_tab: 1,
+            cpu_benchmark_confirm: true,
+            ..Default::default()
+        };
+        state.workspace.repeat_requested = true;
+        state.workspace.preferences.benchmark_repeats = 4;
+        let text = draw(120, 38, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(text.contains("4 prova/e"));
+        assert!(text.contains("4.8s"));
+        state.cpu_benchmark_confirm = false;
+        state.active_tab = 7;
+        state.benchmark_confirm = true;
+        let text = draw(120, 38, &inv, &snapshot, &llm, &mut state, &history);
+        assert!(text.contains("4 prova/e"));
+        assert!(text.contains("massimo 64 token per prova"));
+    }
+
+    #[test]
+    fn comparison_provenance_is_on_its_own_line_and_reachable_by_scrolling() {
+        let (inv, snapshot, llm, history) = fixture();
+        let mut state = workspace_fixture();
+        state.active_tab = 11;
+        let lines = comparison_lines(
+            state.workspace.comparison.as_ref().unwrap(),
+            60,
+            Palette::new(false),
+        );
+        for note in ["Nota: decode nativo", "Nota: tempo totale end-to-end"] {
+            let line = lines
+                .iter()
+                .position(|line| line.to_string().contains(note))
+                .expect("method provenance must remain readable on a dedicated physical line");
+            state.offset = line as u16;
+            let text = draw(64, 18, &inv, &snapshot, &llm, &mut state, &history);
+            assert!(
+                text.contains(note),
+                "method provenance must be reachable inside the real compact viewport"
+            );
+        }
     }
 }

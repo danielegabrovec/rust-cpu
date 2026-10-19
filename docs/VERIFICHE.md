@@ -1,4 +1,68 @@
-# Verifiche — RUST-CPU 0.1.0
+# Verifiche — RUST-CPU 0.2.0
+
+Data: **19 ottobre 2026**. Le prove fisiche sono state eseguite su Windows x64,
+Rust/Cargo 1.99.0 MSVC. Nessun report personale o database di prova viene pubblicato;
+le immagini della documentazione sono fixture sintetiche dichiarate.
+
+## Gate 0.2
+
+Passati formattazione, Clippy con `-D warnings`, suite unit/HTTP/SQL/rendering/CLI
+e build release. 110 test automatici su Windows: la suite controlla anche transazioni,
+schema estraneo/futuro, ripristino/backup, importi incoerenti, vincoli e timeout.
+Gli ID, apostrofi e contenuti simili a SQL vengono passati come parametri.
+
+| Prova reale | Esito |
+|---|---|
+| Sessioni SQLite | Cattura, chiusura, riapertura, rinomina e replay riusciti |
+| Confronto A/B | Risorse, delta e gruppi CPU con3 prove per lato ottenuti |
+| Integrità e backup | Backup riaperto:7 sessioni,10 benchmark,1 avviso; quick_check=ok |
+| Preferenze | Tema chiaro e intervallo500ms salvati e letti nuovamente dal database |
+| Avvisi | SogliaCPU di prova abbassata su archivio isolato: evento reale salvato; soglia poi ripristinata |
+| GPU Windows | Carico e memoria dedicata/condivisa letti sia da AMD integrata sia da NVIDIA |
+| GPU per PID | Attribuzioni dedicate/condivise e carico motori ottenuti su processi reali |
+| Observer Ollama | Stream reale32 token indipendente e16 token associati alla sessione: contatori server e SQLite concordi |
+| Benchmark ripetuti | TUICPU3 prove con sessione automatica; CLI CPU3 e LM Studio2 prove, tutte archiviate |
+| Terminale | F2/F3/F4, r, selezioneA/B, rinomina, replay, ritorno live, F6backup, tema e uscita q dalla guida riusciti |
+| Auth proxy | Avvio reale rifiutato senza tokenfrontend quando upstream protetto; nessuna porta rimasta aperta |
+
+I32 casi HTTP LLM/observer verificano inoltre autenticazione Bearer distinta per
+frontend/upstream, mancata propagazione delle chiavi, streaming, quote, concorrenza,
+redirect, dati malformati e cancellazione. Non sono prove di un runtime personale
+configurato con una chiave reale: per evitare modifiche a quel servizio, tale parte
+è coperta da server locali di test e dal controllo di policy all'avvio.
+
+Le prove benchmark parallele ad altre attività verificano il funzionamento: non
+costituiscono un confronto prestazionale pubblicato. Le metriche native decode e
+quelle end-to-end restano separate. L'export di un confronto visualizzato è congelato,
+anche se nel frattempo arrivano altri campioni. Una regressione lo controlla.
+
+La riproduzione usa fino a2000 punti distribuiti sull'intera sessione; i confronti
+ne usano fino a400 per lato. Le statistiche SQL usano tutti i campioni. Export completo,
+import JSON limitato a64MiB/50000 campioni; backup SQLite per un intero archivio.
+
+Installer0.2 verificato in cartella isolata: avvio, due campioni in SQLite, snapshot reale, quick_check=ok, disinstallazione e archivio conservato. ZIP portable, documentazione, immagini e checksum inclusi; compilazione NSIS senza warning.
+
+## Copertura e limiti correnti
+
+- WDDM provato fisicamente con AMD e NVIDIA. Il percorso Intel è implementato nello
+  stesso provider ma non è stato provato su hardware Intel.
+- LibreHardwareMonitor WMI non era attivo: parser e assenze verificati, letture CPU
+  live non provate con quel provider. Il programma non installa driver kernel.
+- SPD raw e timing live richiedono un provider hardware appropriato: restano esclusi.
+- llama.cpp verificato a livello di protocollo, senza server reale disponibile.
+- Il proxy osserva soltanto richieste instradate volontariamente: nessuna intercettazione
+  automatica delle conversazioni di altri programmi. Non salva prompt né risposte.
+- La memoria perPID può contare risorse condivise; non è una misura esclusiva per conversazione.
+- Installer non firmato; macOS, ARM64, installazione Windows vergine e desktopLinux fisico non certificati.
+
+CI pubblica per Windows/Linux e singoli esiti:
+[GitHub Actions](https://github.com/danielegabrovec/rust-cpu/actions/workflows/ci.yml).
+La presenza del workflow non sostituisce l'esito del commit. Comandi ripetibili in
+[BUILD](BUILD.md), [SESSIONI](SESSIONI.md), `scripts/verify.ps1 -Release` e `scripts/test-installer.ps1`.
+
+---
+
+# Archivio delle verifiche — RUST-CPU 0.1.0
 
 Data: **19 ottobre 2026**. Prima piattaforma provata fisicamente: Windows x64,
 toolchain Rust/Cargo 1.99.0 MSVC, NSIS 3.11. I report hardware locali, le sessioni

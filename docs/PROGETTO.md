@@ -1,5 +1,23 @@
 # RUST-CPU — Progetto e criteri di accettazione
 
+## Estensione0.2 — Session Lab
+
+Tredici viste: alle dieci iniziali si aggiungono Sessioni, Confronto e Impostazioni.
+SQLite incorporato conserva dati, versioni/fonti, benchmark, preferenze e avvisi.
+Registrazione e replay indipendenti, confronto A/B con statistiche complete e preview
+limitate, ripetizioni benchmark e gruppi per metodo. Import/export e backup coerenti,
+parametri SQL, schema riconoscibile e rifiuto di archivi futuri/estranei.
+
+Estesi i provider Windows a WDDM/DXGI per AMD/Intel/NVIDIA e memoria per PID;
+sensori LibreHardwareMonitor opzionali. Observer locale esplicito per richieste LLM
+instradate, senza archiviare testo, con auth frontend/upstream separata.
+Driver kernel, SPD raw e intercettazione trasparente non rientrano nei provider inclusi.
+
+L'implementazione0.2 e i suoi limiti sono descritti in SESSIONI.md, HARDWARE.md,
+OBSERVER.md e VERIFICHE.md. Il progetto iniziale seguente documenta la base0.1.
+
+## Progetto iniziale0.1
+
 Applicazione desktop a terminale, Rust nativo, prima piattaforma Windows x64.
 Obiettivo: riunire inventario hardware di livello avanzato e osservabilità delle LLM locali.
 Software indipendente, senza affiliazione a CPUID/CPU-Z. Non replica codice, marchi o benchmark proprietari.
